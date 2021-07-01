@@ -51,6 +51,8 @@ void PrintVersionHashInfo(TERARKDB_NAMESPACE::Logger* info_log) {
     INFO(info_log, "fsa %s", git_version_hash_info_fsa());
     INFO(info_log, "zbs %s", git_version_hash_info_zbs());
     INFO(info_log, "idx %s", git_version_hash_info_idx());
+#else
+    (void)info_log;
 #endif
   });
 }
@@ -345,6 +347,19 @@ TableBuilder* TerarkZipTableFactory::NewTableBuilder(
               "TerarkZipTableFactory::NewTableBuilder(): "
               "user comparator must be 'leveldb.BytewiseComparator'");
   }
+  if (table_options_.terarkZipMinLevel == -2) {
+    if (!fallback_factory_) {
+      THROW_STD(invalid_argument,
+                "TerarkZipTableFactory::NewTableBuilder(): "
+                "set terarkZipMinLevel = -2 but fallback_factory is null");
+    }
+    return fallback_factory_->NewTableBuilder(table_builder_options,
+                                              column_family_id, file);
+  } else if (table_options_.terarkZipMinLevel < -2) {
+    THROW_STD(invalid_argument,
+              "TerarkZipTableFactory::NewTableBuilder(): "
+              "bad terarkZipMinLevel");
+  }
   int curlevel = table_builder_options.level;
   int numlevel = table_builder_options.ioptions.num_levels;
   int minlevel = table_options_.terarkZipMinLevel;
@@ -409,11 +424,11 @@ std::string TerarkZipTableFactory::GetPrintableTableOptions() const {
   char buffer[kBufferSize];
   const auto& tzto = table_options_;
 
-#define M_String(name)                                      \
-  ret.append(#name);                                        \
-  ret.append("                         : " + strlen(#name), \
-             27 - strlen(#name));                           \
-  ret.append(tzto.name);                                    \
+#define M_String(name)                                                   \
+  ret.append(#name);                                                     \
+  ret.append((const char*)"                         : " + strlen(#name), \
+             27 - strlen(#name));                                        \
+  ret.append(tzto.name);                                                 \
   ret.append("\n")
 
 #define M_NumFmt(name, fmt) PrintBuf("%-24s : " fmt "\n", #name, tzto.name)

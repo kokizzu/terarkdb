@@ -200,19 +200,6 @@ static Status ValidateOptions(
     if (!s.ok()) {
       return s;
     }
-
-    if (cfd.options.ttl > 0 || cfd.options.compaction_options_fifo.ttl > 0) {
-      if (db_options.max_open_files != -1) {
-        return Status::NotSupported(
-            "TTL is only supported when files are always "
-            "kept open (set max_open_files = -1). ");
-      }
-      if (cfd.options.table_factory->Name() !=
-          BlockBasedTableFactory().Name()) {
-        return Status::NotSupported(
-            "TTL is only supported in Block-Based Table format. ");
-      }
-    }
   }
 
   if (db_options.db_paths.size() > 4) {
@@ -1367,8 +1354,13 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                 impl->immutable_db_options_.manual_wal_flush));
       }
 
+      autovector<const ColumnFamilyOptions*> cf_options_list;
+      autovector<const std::string*> column_family_name_list;
+      autovector<ColumnFamilyHandle**> handle_list;
+
       // set column family handles
-      for (auto cf : column_families) {
+      handles->reserve(column_families.size());  // make sure handle ptr valid
+      for (auto& cf : column_families) {
         auto cfd =
             impl->versions_->GetColumnFamilySet()->GetColumnFamily(cf.name);
         if (cfd != nullptr) {
@@ -1377,20 +1369,29 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
           impl->NewThreadStatusCfInfo(cfd);
         } else {
           if (db_options.create_missing_column_families) {
-            // missing column family, create it
-            ColumnFamilyHandle* handle;
-            impl->mutex_.Unlock();
-            s = impl->CreateColumnFamily(cf.options, cf.name, &handle);
-            impl->mutex_.Lock();
-            if (s.ok()) {
-              handles->push_back(handle);
-            } else {
-              break;
-            }
+            // missing column family, create it later
+            cf_options_list.emplace_back(&cf.options);
+            column_family_name_list.emplace_back(&cf.name);
+            handles->push_back(nullptr);
+            // we reserve handles first, is OK to get a ptr
+            handle_list.emplace_back(&handles->back());
           } else {
             s = Status::InvalidArgument("Column family not found: ", cf.name);
             break;
           }
+        }
+      }
+      if (s.ok() && !cf_options_list.empty()) {
+        // create missing column families
+        impl->mutex_.Unlock();
+        autovector<Status> s_list = impl->CreateColumnFamilyImpl(
+            cf_options_list, column_family_name_list, handle_list);
+        impl->mutex_.Lock();
+        auto it = std::find_if(s_list.begin(), s_list.end(),
+                               [](const Status& s) { return !s.ok(); });
+        if (it != s_list.end()) {
+          // let get 1st non-ok status ...
+          s = *it;
         }
       }
     }
@@ -1420,18 +1421,6 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
 
   if (s.ok()) {
     for (auto cfd : *impl->versions_->GetColumnFamilySet()) {
-      if (cfd->ioptions()->compaction_style == kCompactionStyleFIFO) {
-        auto* vstorage = cfd->current()->storage_info();
-        for (int i = 1; i < vstorage->num_levels(); ++i) {
-          int num_files = vstorage->NumLevelFiles(i);
-          if (num_files > 0) {
-            s = Status::InvalidArgument(
-                "Not all files are at level 0. Cannot "
-                "open with FIFO compaction style.");
-            break;
-          }
-        }
-      }
       if (!cfd->mem()->IsSnapshotSupported()) {
         impl->is_snapshot_supported_ = false;
       }

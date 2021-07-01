@@ -280,48 +280,49 @@ Compaction* UniversalCompactionPicker::PickCompaction(
 
   // Check for size amplification first.
   Compaction* c = nullptr;
-  if (vstorage->has_space_amplification() ||
-      sorted_runs.size() >=
-          static_cast<size_t>(
-              mutable_cf_options.level0_file_num_compaction_trigger)) {
-    if (ioptions_.enable_lazy_compaction) {
-      bool has_map_compaction = false;
-      for (auto cip : compactions_in_progress_) {
-        if (cip->compaction_type() == kMapCompaction) {
-          has_map_compaction = true;
-          break;
-        }
-      }
-      int reduce_sorted_run_target = std::numeric_limits<int>::max();
-      if (!has_map_compaction &&
-          (c = PickTrivialMoveCompaction(cf_name, mutable_cf_options, vstorage,
-                                         sorted_runs, log_buffer)) == nullptr &&
-          table_cache_ != nullptr) {
-        int min_sorted_run_size = std::max(1, ioptions_.num_levels - 1);
-        int max_sorted_run_size =
-            std::max(1, mutable_cf_options.level0_file_num_compaction_trigger +
-                            ioptions_.num_levels - 2);
+  if (ioptions_.enable_lazy_compaction) {
+    bool has_map_compaction_in_progress =
+        std::find_if(compactions_in_progress_.begin(),
+                     compactions_in_progress_.end(), [](Compaction* cip) {
+                       return cip->compaction_type() == kMapCompaction;
+                     }) != compactions_in_progress_.end();
+    int reduce_sorted_run_target = std::numeric_limits<int>::max();
+    if (!has_map_compaction_in_progress &&
+        (c = PickTrivialMoveCompaction(cf_name, mutable_cf_options, vstorage,
+                                       sorted_runs, log_buffer)) == nullptr &&
+        table_cache_ != nullptr) {
+      int min_sorted_run_size = std::max(1, ioptions_.num_levels - 1);
+      int max_sorted_run_size =
+          std::max(1, mutable_cf_options.level0_file_num_compaction_trigger +
+                          ioptions_.num_levels - 2);
 
-        int read_amp_target = vstorage->read_amplification() -
-                              llround(sqrt(vstorage->read_amplification()));
-        int sorted_runs_target = int(sorted_runs.size()) - 2;
+      int read_amp_target = vstorage->read_amplification() -
+                            llround(sqrt(vstorage->read_amplification()));
+      int sorted_runs_target = int(sorted_runs.size()) - 2;
 
-        reduce_sorted_run_target = std::max(
-            {min_sorted_run_size, sorted_runs_target, read_amp_target});
-        reduce_sorted_run_target =
-            std::min(max_sorted_run_size, reduce_sorted_run_target);
-      }
-      if (int(sorted_runs.size()) > reduce_sorted_run_target &&
-          (c = PickCompactionToReduceSortedRuns(
-               cf_name, mutable_cf_options, vstorage, score, &sorted_runs,
-               reduce_sorted_run_target, log_buffer)) != nullptr) {
-        ROCKS_LOG_BUFFER(log_buffer,
-                         "[%s] Universal: compacting for lazy compaction\n",
-                         cf_name.c_str());
-      }
-    } else if ((c = PickCompactionToReduceSizeAmp(cf_name, mutable_cf_options,
-                                                  vstorage, score, sorted_runs,
-                                                  log_buffer)) != nullptr) {
+      reduce_sorted_run_target =
+          std::max({min_sorted_run_size, sorted_runs_target, read_amp_target});
+      reduce_sorted_run_target =
+          std::min(max_sorted_run_size, reduce_sorted_run_target);
+    }
+    if (int(sorted_runs.size()) > reduce_sorted_run_target &&
+        (c = PickCompactionToReduceSortedRuns(
+             cf_name, mutable_cf_options, vstorage, score, &sorted_runs,
+             reduce_sorted_run_target, log_buffer)) != nullptr) {
+      ROCKS_LOG_BUFFER(log_buffer,
+                       "[%s] Universal: compacting for lazy compaction\n",
+                       cf_name.c_str());
+    }
+    if (c == nullptr && table_cache_ != nullptr) {
+      c = PickCompositeCompaction(cf_name, mutable_cf_options, vstorage,
+                                  snapshots, sorted_runs, log_buffer);
+    }
+  } else if (sorted_runs.size() >=
+             static_cast<size_t>(
+                 mutable_cf_options.level0_file_num_compaction_trigger)) {
+    if ((c = PickCompactionToReduceSizeAmp(cf_name, mutable_cf_options,
+                                           vstorage, score, sorted_runs,
+                                           log_buffer)) != nullptr) {
       ROCKS_LOG_BUFFER(log_buffer, "[%s] Universal: compacting for size amp\n",
                        cf_name.c_str());
     } else {
@@ -371,10 +372,6 @@ Compaction* UniversalCompactionPicker::PickCompaction(
       }
     }
   }
-  if (c == nullptr && table_cache_ != nullptr) {
-    c = PickCompositeCompaction(cf_name, mutable_cf_options, vstorage,
-                                snapshots, sorted_runs, log_buffer);
-  }
   if (c == nullptr && !ioptions_.enable_lazy_compaction) {
     if ((c = PickDeleteTriggeredCompaction(cf_name, mutable_cf_options,
                                            vstorage, score, sorted_runs,
@@ -384,7 +381,6 @@ Compaction* UniversalCompactionPicker::PickCompaction(
                        cf_name.c_str());
     }
   }
-
   if (c == nullptr) {
     TEST_SYNC_POINT_CALLBACK("UniversalCompactionPicker::PickCompaction:Return",
                              nullptr);
@@ -395,9 +391,10 @@ Compaction* UniversalCompactionPicker::PickCompaction(
       mutable_cf_options.compaction_options_universal.allow_trivial_move;
   if (c->compaction_reason() != CompactionReason::kTrivialMoveLevel &&
       allow_trivial_move) {
-    // check level has map or link sst
+    // check level has map sst or sst marked for compaction
     for (auto& level_files : *c->inputs()) {
-      if (vstorage->has_map_sst(level_files.level)) {
+      if (vstorage->has_map_sst(level_files.level) ||
+          vstorage->has_marked_for_compaction(level_files.level)) {
         allow_trivial_move = false;
         break;
       }
@@ -506,11 +503,11 @@ Compaction* UniversalCompactionPicker::PickCompaction(
 
 Compaction* UniversalCompactionPicker::CompactRange(
     const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
-    VersionStorageInfo* vstorage, int input_level, int output_level,
-    uint32_t output_path_id, uint32_t max_subcompactions,
-    const InternalKey* begin, const InternalKey* end,
-    InternalKey** compaction_end, bool* manual_conflict,
-    const std::unordered_set<uint64_t>* files_being_compact) {
+    SeparationType separation_type, VersionStorageInfo* vstorage,
+    int input_level, int output_level, uint32_t output_path_id,
+    uint32_t max_subcompactions, const InternalKey* begin,
+    const InternalKey* end, InternalKey** compaction_end, bool* manual_conflict,
+    const chash_set<uint64_t>* files_being_compact) {
   if (input_level == ColumnFamilyData::kCompactAllLevels &&
       ioptions_.enable_lazy_compaction) {
     auto hit_sst = [&](const FileMetaData* f) {
@@ -624,6 +621,7 @@ Compaction* UniversalCompactionPicker::CompactRange(
       params.max_subcompactions = 1;
       params.compaction_type = kMapCompaction;
     } else {
+      params.separation_type = separation_type;
       *compaction_end = nullptr;
     }
     return RegisterCompaction(new Compaction(std::move(params)));
@@ -631,14 +629,15 @@ Compaction* UniversalCompactionPicker::CompactRange(
 
   if (!ioptions_.enable_lazy_compaction) {
     return CompactionPicker::CompactRange(
-        cf_name, mutable_cf_options, vstorage, input_level, output_level,
-        output_path_id, max_subcompactions, begin, end, compaction_end,
-        manual_conflict, files_being_compact);
+        cf_name, mutable_cf_options, separation_type, vstorage, input_level,
+        output_level, output_path_id, max_subcompactions, begin, end,
+        compaction_end, manual_conflict, files_being_compact);
   }
   LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL, ioptions_.info_log);
-  auto c = PickRangeCompaction(
-      cf_name, mutable_cf_options, vstorage, input_level, begin, end,
-      max_subcompactions, files_being_compact, manual_conflict, &log_buffer);
+  auto c =
+      PickRangeCompaction(cf_name, mutable_cf_options, separation_type,
+                          vstorage, input_level, begin, end, max_subcompactions,
+                          files_being_compact, manual_conflict, &log_buffer);
   log_buffer.FlushBufferToLog();
   return c;
 }
@@ -1110,7 +1109,7 @@ Compaction* UniversalCompactionPicker::PickDeleteTriggeredCompaction(
     start_level_inputs.files.clear();
     output_level = 0;
     for (FileMetaData* f : vstorage->LevelFiles(0)) {
-      if (f->marked_for_compaction) {
+      if (f->marked_for_compaction && !f->being_compacted) {
         compact = true;
       }
       if (compact) {

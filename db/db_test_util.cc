@@ -480,10 +480,6 @@ Options DBTestBase::GetOptions(
       table_options.checksum = kxxHash64;
       break;
     }
-    case kFIFOCompaction: {
-      options.compaction_style = kCompactionStyleFIFO;
-      break;
-    }
     case kBlockBasedTableWithPrefixHashIndex: {
       table_options.index_type = BlockBasedTableOptions::kHashSearch;
       options.prefix_extractor.reset(NewFixedPrefixTransform(1));
@@ -551,6 +547,10 @@ Options DBTestBase::GetOptions(
       // This options optimize 2PC commit path
       options.two_write_queues = true;
       options.manual_wal_flush = true;
+      break;
+    }
+    case kOptimizeRangeDeletion: {
+      options.optimize_range_deletion = true;
       break;
     }
 

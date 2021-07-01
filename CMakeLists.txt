@@ -14,9 +14,16 @@ IF(CMAKE_BUILD_TYPE STREQUAL "" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebug")
 ENDIF()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/modules/")
-SET(CMAKE_INSTALL_LIBDIR ${CMAKE_BINARY_DIR}/lib)
-SET(CMAKE_INSTALL_BINDIR ${CMAKE_BINARY_DIR}/bin)
-SET(CMAKE_INSTALL_INCLUDEDIR ${CMAKE_BINARY_DIR}/include)
+
+MESSAGE("[terarkdb] cmake install prefix: ${CMAKE_INSTALL_PREFIX}")
+SET(CMAKE_INSTALL_LIBDIR ${CMAKE_INSTALL_PREFIX}/lib)
+SET(CMAKE_INSTALL_BINDIR ${CMAKE_INSTALL_PREFIX}/bin)
+
+if (TERARK_INCLUDE_PREFIX)
+  SET(CMAKE_INSTALL_INCLUDEDIR ${CMAKE_INSTALL_PREFIX}/include/${TERARK_INCLUDE_PREFIX})
+else()
+  SET(CMAKE_INSTALL_INCLUDEDIR ${CMAKE_INSTALL_PREFIX}/include)
+endif()
 
 option(WITH_COVERAGE "build with gcov support" OFF)
 option(WITH_JEMALLOC "build with JeMalloc" ON)
@@ -34,19 +41,21 @@ include(CMakeDependentOption)
 CMAKE_DEPENDENT_OPTION(WITH_TESTS "build with tests" ON "CMAKE_BUILD_TYPE STREQUAL Debug" OFF)
 option(WITH_TOOLS "build with tools" OFF)
 option(WITH_TERARK_ZIP "build with TerarkZipTable support" ON)
+option(WITH_DIAGNOSE_CACHE "build with diagnosable cache support" OFF)
 option(WITH_BOOSTLIB "build with boost, if WITH_TERARK_ZIP is ON, this will also set to ON" OFF)
 option(WITH_TERARKDB_NAMESPACE "namespace" "terarkdb")
+
+if(NOT WITH_TERARKDB_NAMESPACE)
+  SET(WITH_TERARKDB_NAMESPACE "terarkdb")
+endif()
+MESSAGE(STATUS "terarkdb namespace: " ${WITH_TERARKDB_NAMESPACE})
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/include/rocksdb/terark_namespace.h.in ${CMAKE_CURRENT_SOURCE_DIR}/include/rocksdb/terark_namespace.h)
 
 option(BUILD_SUFFIX "library sufix" "d")
 option(FORCE_TERARKDB_RELEASE_BUILD "ignore outside cmake_build_type" OFF)
 
 SET(CMAKE_THREAD_PREFER_PTHREAD TRUE)
 Find_Package(Threads REQUIRED)
-
-#----------------------- namespace
-if(WITH_TERARKDB_NAMESPACE)
-  add_definitions(-DTERARKDB_NAMESPACE=${WITH_TERARKDB_NAMESPACE})
-endif()
 
 #----------------------- Global Options
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin" OR CMAKE_BUILD_TYPE STREQUAL "Release" OR WITH_JEMALLOC)
@@ -539,7 +548,6 @@ set(SOURCES
         db/compaction_iterator.cc
         db/compaction_job.cc
         db/compaction_picker.cc
-        db/compaction_picker_fifo.cc
         db/compaction_picker_universal.cc
         db/convenience.cc
         db/db_filesnapshot.cc
@@ -897,7 +905,8 @@ if(NOT WIN32 OR ROCKSDB_INSTALL_ON_WINDOWS)
   install(
           DIRECTORY include/rocksdb
           COMPONENT devel
-          DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+          DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+          PATTERN "*.h.in" EXCLUDE)
 
   install(
         TARGETS ${ROCKSDB_STATIC_LIB}
@@ -906,12 +915,13 @@ if(NOT WIN32 OR ROCKSDB_INSTALL_ON_WINDOWS)
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   )
 
-  #install(
-  #  EXPORT RocksDBTargets
-  #  COMPONENT devel
-  #  DESTINATION ${package_config_destination}
-  #  NAMESPACE TERARKDB_NAMESPACE::
-  #)
+  # We should also expose terarkdb's source dir
+  INSTALL(DIRECTORY memtable monitoring env db cache options port table util utilities
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING 
+        PATTERN "*.h"
+        PATTERN "*.hpp"
+  )
 
   install(
     FILES
@@ -1009,7 +1019,6 @@ if(WITH_TESTS)
         monitoring/histogram_test.cc
         monitoring/iostats_context_test.cc
         monitoring/statistics_test.cc
-        monitoring/stats_history_test.cc
         options/options_settable_test.cc
         options/options_test.cc
         table/block_based_filter_block_test.cc

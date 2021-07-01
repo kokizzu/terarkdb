@@ -30,13 +30,10 @@ enum CompactionStyle : char {
   // Universal compaction style
   // Not supported in ROCKSDB_LITE.
   kCompactionStyleUniversal = 0x1,
-  // FIFO compaction style
-  // Not supported in ROCKSDB_LITE
-  kCompactionStyleFIFO = 0x2,
   // Disable background compaction. Compaction jobs are submitted
   // via CompactFiles().
   // Not supported in ROCKSDB_LITE
-  kCompactionStyleNone = 0x3,
+  kCompactionStyleNone = 0x2,
 };
 
 // In Level-based compaction, it Determines which file from a level to be
@@ -545,13 +542,6 @@ struct AdvancedColumnFamilyOptions {
   // SetOptions("compaction_options_universal", "{size_ratio=2;}")
   CompactionOptionsUniversal compaction_options_universal;
 
-  // The options for FIFO compaction style
-  //
-  // Dynamically changeable through SetOptions() API
-  // Dynamic change example:
-  // SetOptions("compaction_options_fifo", "{max_table_files_size=100;ttl=2;}")
-  CompactionOptionsFIFO compaction_options_fifo;
-
   // An iteration->Next() sequentially skips over keys with the same
   // user-key unless this option is set. This number specifies the number
   // of keys (with the same userkey) that will be sequentially
@@ -618,6 +608,12 @@ struct AdvancedColumnFamilyOptions {
   // Default: false
   bool optimize_filters_for_hits = false;
 
+  // Enable lazy level compaction fast push range_deletions
+  // It is recommended to disabled when RangeDeletion writes frequently
+  //
+  // Default: false
+  bool optimize_range_deletion = false;
+
   // After writing every SST file, reopen it and read all the keys.
   //
   // Default: false
@@ -637,15 +633,6 @@ struct AdvancedColumnFamilyOptions {
   //
   // Dynamically changeable through SetOptions() API
   bool report_bg_io_stats = false;
-
-  // Non-bottom-level files older than TTL will go through the compaction
-  // process. This needs max_open_files to be set to -1.
-  // Enabled only for level compaction for now.
-  //
-  // Default: 0 (disabled)
-  //
-  // Dynamically changeable through SetOptions() API
-  uint64_t ttl = 0;
 
   // Create ColumnFamilyOptions with default values for all fields
   AdvancedColumnFamilyOptions();

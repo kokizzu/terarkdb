@@ -135,6 +135,10 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {NUMBER_MULTIGET_KEYS_FOUND, "rocksdb.number.multiget.keys.found"},
     {NO_ITERATOR_CREATED, "rocksdb.num.iterator.created"},
     {NO_ITERATOR_DELETED, "rocksdb.num.iterator.deleted"},
+    {GC_GET_KEYS, "rocksdb.num.gc.get_keys"},
+    {GC_TOUCH_FILES, "rocksdb.num.gc.touch_files"},
+    {GC_SKIP_GET_BY_SEQ, "rocksdb.num.gc.skip_by_seqno"},
+    {GC_SKIP_GET_BY_FILE, "rocksdb.num.gc.skip_by_file_meta"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
@@ -173,6 +177,7 @@ const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
     {PICK_COMPACTION_TIME, "rocksdb.pick.compaction.micros"},
     {PICK_GARBAGE_COLLECTION_TIME, "rocksdb.pick.gc.micros"},
     {INSTALL_SUPER_VERSION_TIME, "rocksdb.install.super.version.micros"},
+    {BUILD_VERSION_TIME, "rocksdb.build.version.micros"},
 };
 
 std::shared_ptr<Statistics> CreateDBStatistics() {

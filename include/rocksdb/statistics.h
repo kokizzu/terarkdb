@@ -253,6 +253,11 @@ enum Tickers : uint32_t {
 
   NO_ITERATOR_CREATED,  // number of iterators created
   NO_ITERATOR_DELETED,  // number of iterators deleted
+
+  GC_GET_KEYS,
+  GC_TOUCH_FILES,
+  GC_SKIP_GET_BY_SEQ,
+  GC_SKIP_GET_BY_FILE,
   TICKER_ENUM_MAX
 };
 
@@ -314,6 +319,7 @@ enum Histograms : uint32_t {
   PICK_COMPACTION_TIME,
   PICK_GARBAGE_COLLECTION_TIME,
   INSTALL_SUPER_VERSION_TIME,
+  BUILD_VERSION_TIME,
 
   HISTOGRAM_ENUM_MAX,
 };

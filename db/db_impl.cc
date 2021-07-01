@@ -925,21 +925,21 @@ void DBImpl::ScheduleTtlGC() {
         std::min(earliest_time_begin_compact, latest_time_end_compact) <= now;
     if (should_mark) {
       ROCKS_LOG_BUFFER(&log_buffer_info,
-                       "SST Table property level=%d file-id = %" PRIu64
-                       ", info : (%" PRIu64 " , %" PRIu64 ") now = %" PRIu64,
-                       level, file_number, earliest_time_begin_compact,
+                       "SST #%" PRIu64
+                       " marked for compaction @L%d , property: (%" PRIu64
+                       " , %" PRIu64 ") now: %" PRIu64,
+                       file_number, level, earliest_time_begin_compact,
                        latest_time_end_compact, now);
     }
     return should_mark;
   };
-  ROCKS_LOG_INFO(immutable_db_options_.info_log, "Start ScheduleTtlGC");
   mutex_.Lock();
   for (auto cfd : *versions_->GetColumnFamilySet()) {
-    uint64_t mark_count = 0;
-    uint64_t marked_count = 0;
-    uint64_t total_cnt = 0;
-    if (!cfd->initialized() ||
-        cfd->GetLatestCFOptions().ttl_extractor_factory == nullptr) {
+    uint64_t new_mark_count = 0;
+    uint64_t old_mark_count = 0;
+    uint64_t total_count = 0;
+    if (!cfd->initialized() || cfd->IsDropped() ||
+        cfd->ioptions()->ttl_extractor_factory == nullptr) {
       continue;
     }
     VersionStorageInfo* vstorage = cfd->current()->storage_info();
@@ -948,31 +948,34 @@ void DBImpl::ScheduleTtlGC() {
         if (meta->being_compacted) {
           continue;
         }
-        ++total_cnt;
-        marked_count += meta->marked_for_compaction;
+        ++total_count;
+        old_mark_count += meta->marked_for_compaction;
         TEST_SYNC_POINT("DBImpl:Exist-SST");
         if (!meta->marked_for_compaction &&
             should_marked_for_compacted(
                 l, meta->fd.GetNumber(), meta->prop.earliest_time_begin_compact,
                 meta->prop.latest_time_end_compact, nowSeconds)) {
           meta->marked_for_compaction = true;
-          vstorage->AddFilesMarkedForCompaction(l, meta);
         }
         if (meta->marked_for_compaction) {
-          mark_count++;
+          new_mark_count++;
           TEST_SYNC_POINT("DBImpl:ScheduleTtlGC-mark");
         }
       }
     }
-    if (mark_count > marked_count && !cfd->queued_for_compaction()) {
-      AddToCompactionQueue(cfd);
-      unscheduled_compactions_++;
+    if (new_mark_count > old_mark_count) {
+      vstorage->ComputeCompactionScore(*cfd->ioptions(),
+                                       *cfd->GetLatestMutableCFOptions());
+      if (!cfd->queued_for_compaction()) {
+        AddToCompactionQueue(cfd);
+        unscheduled_compactions_++;
+      }
     }
     ROCKS_LOG_BUFFER(&log_buffer_debug,
                      "[%s] SSTs total marked = %" PRIu64
                      ", new marked = %" PRIu64 ", file count: %" PRIu64,
-                     cfd->GetName().c_str(), marked_count, mark_count,
-                     total_cnt);
+                     cfd->GetName().c_str(), old_mark_count, new_mark_count,
+                     total_count);
   }
   if (unscheduled_compactions_ > 0) {
     MaybeScheduleFlushOrCompaction();
@@ -981,6 +984,7 @@ void DBImpl::ScheduleTtlGC() {
   log_buffer_info.FlushBufferToLog();
   log_buffer_debug.FlushBufferToLog();
 }
+
 void DBImpl::DumpStats() {
   TEST_SYNC_POINT("DBImpl::DumpStats:1");
 #ifndef ROCKSDB_LITE
@@ -1114,7 +1118,7 @@ Status DBImpl::SetOptions(
   SuperVersionContext sv_context(/* create_superversion */ true);
   {
     InstrumentedMutexLock l(&mutex_);
-    s = cfd->SetOptions(options_map);
+    s = cfd->SetOptions(immutable_db_options_, options_map);
     if (s.ok()) {
       new_options = *cfd->GetLatestMutableCFOptions();
       // Append new version to recompute compaction score.
@@ -1172,8 +1176,8 @@ Status DBImpl::SetDBOptions(
   Status s;
   Status persist_options_status;
   bool wal_changed = false;
-  WriteContext write_context;
   {
+    WriteContext write_context(immutable_db_options_.info_log.get());
     InstrumentedMutexLock l(&mutex_);
     s = GetMutableDBOptionsFromStrings(mutable_db_options_, options_map,
                                        &new_options);
@@ -2020,7 +2024,8 @@ Status DBImpl::CreateColumnFamily(const ColumnFamilyOptions& cf_options,
                                   const std::string& column_family,
                                   ColumnFamilyHandle** handle) {
   assert(handle != nullptr);
-  Status s = CreateColumnFamilyImpl(cf_options, column_family, handle);
+  Status s =
+      CreateColumnFamilyImpl({&cf_options}, {&column_family}, {handle}).front();
   if (s.ok()) {
     s = WriteOptionsFile(true /*need_mutex_lock*/,
                          true /*need_enter_write_thread*/);
@@ -2035,25 +2040,37 @@ Status DBImpl::CreateColumnFamilies(
   assert(handles != nullptr);
   handles->clear();
   size_t num_cf = column_family_names.size();
-  Status s;
-  bool success_once = false;
+  autovector<const ColumnFamilyOptions*> cf_options_list;
+  autovector<const std::string*> column_family_name_list;
+  autovector<ColumnFamilyHandle**> handle_list;
+  handles->resize(num_cf);
   for (size_t i = 0; i < num_cf; i++) {
-    ColumnFamilyHandle* handle;
-    s = CreateColumnFamilyImpl(cf_options, column_family_names[i], &handle);
-    if (!s.ok()) {
-      break;
-    }
-    handles->push_back(handle);
-    success_once = true;
+    cf_options_list.emplace_back(&cf_options);
+    column_family_name_list.emplace_back(&column_family_names[i]);
+    handle_list.emplace_back(&(*handles)[i]);
   }
-  if (success_once) {
+  autovector<Status> s_list = CreateColumnFamilyImpl(
+      cf_options_list, column_family_name_list, handle_list);
+  bool success_count = std::count_if(s_list.begin(), s_list.end(),
+                                     [](const Status& s) { return s.ok(); });
+  Status s;
+  if (success_count > 0) {
     Status persist_options_status = WriteOptionsFile(
         true /*need_mutex_lock*/, true /*need_enter_write_thread*/);
-    if (s.ok() && !persist_options_status.ok()) {
+    if (success_count == num_cf && !persist_options_status.ok()) {
       s = persist_options_status;
     }
   }
-  return s;
+  if (success_count == num_cf) {
+    return s;
+  } else {
+    handles->resize(
+        std::remove_if(handles->begin(), handles->end(),
+                       [](ColumnFamilyHandle* h) { return h == nullptr; }) -
+        handles->begin());
+    return *std::find_if(s_list.begin(), s_list.end(),
+                         [](const Status& s) { return !s.ok(); });
+  }
 }
 
 Status DBImpl::CreateColumnFamilies(
@@ -2062,136 +2079,202 @@ Status DBImpl::CreateColumnFamilies(
   assert(handles != nullptr);
   handles->clear();
   size_t num_cf = column_families.size();
-  Status s;
-  bool success_once = false;
+  autovector<const ColumnFamilyOptions*> cf_options_list;
+  autovector<const std::string*> column_family_name_list;
+  autovector<ColumnFamilyHandle**> handle_list;
+  handles->resize(num_cf);
   for (size_t i = 0; i < num_cf; i++) {
-    ColumnFamilyHandle* handle;
-    s = CreateColumnFamilyImpl(column_families[i].options,
-                               column_families[i].name, &handle);
-    if (!s.ok()) {
-      break;
-    }
-    handles->push_back(handle);
-    success_once = true;
+    cf_options_list.emplace_back(&column_families[i].options);
+    column_family_name_list.emplace_back(&column_families[i].name);
+    handle_list.emplace_back(&(*handles)[i]);
   }
-  if (success_once) {
+  autovector<Status> s_list = CreateColumnFamilyImpl(
+      cf_options_list, column_family_name_list, handle_list);
+  bool success_count = std::count_if(s_list.begin(), s_list.end(),
+                                     [](const Status& s) { return s.ok(); });
+  Status s;
+  if (success_count > 0) {
     Status persist_options_status = WriteOptionsFile(
         true /*need_mutex_lock*/, true /*need_enter_write_thread*/);
-    if (s.ok() && !persist_options_status.ok()) {
+    if (success_count == num_cf && !persist_options_status.ok()) {
       s = persist_options_status;
     }
   }
-  return s;
+  if (success_count == num_cf) {
+    return s;
+  } else {
+    handles->resize(
+        std::remove_if(handles->begin(), handles->end(),
+                       [](ColumnFamilyHandle* h) { return h == nullptr; }) -
+        handles->begin());
+    return *std::find_if(s_list.begin(), s_list.end(),
+                         [](const Status& s) { return !s.ok(); });
+  }
 }
 
-Status DBImpl::CreateColumnFamilyImpl(const ColumnFamilyOptions& cf_options,
-                                      const std::string& column_family_name,
-                                      ColumnFamilyHandle** handle) {
-  Status s;
+autovector<Status> DBImpl::CreateColumnFamilyImpl(
+    autovector<const ColumnFamilyOptions*> cf_options,
+    autovector<const std::string*> column_family_name,
+    autovector<ColumnFamilyHandle**> handle) {
+  assert(cf_options.size() == column_family_name.size());
+  assert(cf_options.size() == handle.size());
+  autovector<Status> s;
+  s.resize(cf_options.size());
   Status persist_options_status;
-  *handle = nullptr;
+  for (auto& h : handle) {
+    *h = nullptr;
+  }
 #if !defined(_MSC_VER) && !defined(__APPLE__)
   const char* terarkdb_localTempDir = getenv("TerarkZipTable_localTempDir");
   const char* terarkConfigString = getenv("TerarkConfigString");
   if (terarkdb_localTempDir || terarkConfigString) {
     if (terarkdb_localTempDir &&
         ::access(terarkdb_localTempDir, R_OK | W_OK) != 0) {
-      return Status::InvalidArgument(
+      Status check_s = Status::InvalidArgument(
           "Must exists, and Permission ReadWrite is required on "
           "env TerarkZipTable_localTempDir",
           terarkdb_localTempDir);
+      for (size_t i = 0; i < cf_options.size(); ++i) {
+        s[i] = check_s;
+      }
+      return s;
     }
 #ifdef WITH_TERARK_ZIP
-    if (!TerarkZipIsBlackListCF(column_family_name)) {
-      TerarkZipCFOptionsFromEnv(const_cast<ColumnFamilyOptions&>(cf_options),
-                                dbname_);
+    for (size_t i = 0; i < cf_options.size(); ++i) {
+      if (!TerarkZipIsBlackListCF(*column_family_name[i])) {
+        TerarkZipCFOptionsFromEnv(
+            const_cast<ColumnFamilyOptions&>(*cf_options[i]), dbname_);
+      }
     }
 #endif
   }
 #endif
 
-  s = CheckCompressionSupported(cf_options);
-  if (s.ok() && immutable_db_options_.allow_concurrent_memtable_write) {
-    s = CheckConcurrentWritesSupported(cf_options);
-  }
-  if (s.ok()) {
-    s = CheckCFPathsSupported(initial_db_options_, cf_options);
-  }
-  if (s.ok()) {
-    for (auto& cf_path : cf_options.cf_paths) {
-      s = env_->CreateDirIfMissing(cf_path.path);
-      if (!s.ok()) {
-        break;
+  size_t ok_count = 0;
+  for (size_t i = 0; i < cf_options.size(); ++i) {
+    s[i] = CheckCompressionSupported(*cf_options[i]);
+    if (s[i].ok() && immutable_db_options_.allow_concurrent_memtable_write) {
+      s[i] = CheckConcurrentWritesSupported(*cf_options[i]);
+    }
+    if (s[i].ok()) {
+      s[i] = CheckCFPathsSupported(initial_db_options_, *cf_options[i]);
+    }
+    if (s[i].ok()) {
+      for (auto& cf_path : cf_options[i]->cf_paths) {
+        s[i] = env_->CreateDirIfMissing(cf_path.path);
+        if (!s[i].ok()) {
+          break;
+        }
       }
     }
-  }
-  if (!s.ok()) {
-    return s;
+    ok_count += s[i].ok();
   }
 
   SuperVersionContext sv_context(/* create_superversion */ true);
-  {
+  if (ok_count > 0) {
+    struct CreateCFContext {
+      VersionEdit edit;
+      MutableCFOptions mopt;
+    };
+    autovector<CreateCFContext> edit_vec;
+    autovector<ColumnFamilyData*> cfds;
+    autovector<const MutableCFOptions*> mutable_cf_options_list;
+    autovector<autovector<VersionEdit*>> edit_lists;
+    autovector<const ColumnFamilyOptions*> column_family_options_list;
+
     InstrumentedMutexLock l(&mutex_);
 
-    if (versions_->GetColumnFamilySet()->GetColumnFamily(column_family_name) !=
-        nullptr) {
-      return Status::InvalidArgument("Column family already exists");
+    ok_count = 0;
+    for (size_t i = 0; i < cf_options.size(); ++i) {
+      if (!s[i].ok()) {
+        continue;
+      }
+      if (versions_->GetColumnFamilySet()->GetColumnFamily(
+              *column_family_name[i]) != nullptr) {
+        s[i] = Status::InvalidArgument("Column family already exists");
+        continue;
+      }
+
+      edit_vec.emplace_back();
+      VersionEdit& edit = edit_vec.back().edit;
+      edit.AddColumnFamily(*column_family_name[i]);
+      uint32_t new_id =
+          versions_->GetColumnFamilySet()->GetNextColumnFamilyID();
+      edit.SetColumnFamily(new_id);
+      edit.SetLogNumber(logfile_number_);
+      edit.SetComparatorName(cf_options[i]->comparator->Name());
+      edit_vec[i].mopt = MutableCFOptions(*cf_options[i], env_);
+
+      cfds.emplace_back(nullptr);
+      mutable_cf_options_list.emplace_back(&edit_vec.back().mopt);
+      autovector<VersionEdit*> edit_list;
+      edit_list.emplace_back(&edit);
+      edit_lists.emplace_back(edit_list);
+      column_family_options_list.emplace_back(cf_options[i]);
+
+      ++ok_count;
     }
-    VersionEdit edit;
-    edit.AddColumnFamily(column_family_name);
-    uint32_t new_id = versions_->GetColumnFamilySet()->GetNextColumnFamilyID();
-    edit.SetColumnFamily(new_id);
-    edit.SetLogNumber(logfile_number_);
-    edit.SetComparatorName(cf_options.comparator->Name());
 
     // LogAndApply will both write the creation in MANIFEST and create
     // ColumnFamilyData object
-    {  // write thread
+    if (ok_count > 0) {  // write thread
       WriteThread::Writer w;
       write_thread_.EnterUnbatched(&w, &mutex_);
       // LogAndApply will both write the creation in MANIFEST and create
       // ColumnFamilyData object
-      s = versions_->LogAndApply(nullptr, MutableCFOptions(cf_options, env_),
-                                 &edit, &mutex_, directories_.GetDbDir(), false,
-                                 &cf_options);
+      auto apply_s = versions_->LogAndApply(
+          cfds, mutable_cf_options_list, edit_lists, &mutex_,
+          directories_.GetDbDir(), false, column_family_options_list);
       write_thread_.ExitUnbatched(&w);
-    }
-    if (s.ok()) {
-      auto* cfd =
-          versions_->GetColumnFamilySet()->GetColumnFamily(column_family_name);
-      assert(cfd != nullptr);
-      s = cfd->AddDirectories();
-    }
-    if (s.ok()) {
-      single_column_family_mode_ = false;
-      auto* cfd =
-          versions_->GetColumnFamilySet()->GetColumnFamily(column_family_name);
-      assert(cfd != nullptr);
-      InstallSuperVersionAndScheduleWork(cfd, &sv_context,
-                                         *cfd->GetLatestMutableCFOptions());
-
-      if (!cfd->mem()->IsSnapshotSupported()) {
-        is_snapshot_supported_ = false;
+      if (!apply_s.ok()) {
+        for (size_t i = 0; i < cf_options.size(); ++i) {
+          if (s[i].ok()) {
+            s[i] = apply_s;
+          }
+        }
       }
+    }
+    for (size_t i = 0; i < cf_options.size(); ++i) {
+      if (s[i].ok()) {
+        auto* cfd = versions_->GetColumnFamilySet()->GetColumnFamily(
+            *column_family_name[i]);
+        assert(cfd != nullptr);
+        s[i] = cfd->AddDirectories();
+      }
+      if (s[i].ok()) {
+        single_column_family_mode_ = false;
+        auto* cfd = versions_->GetColumnFamilySet()->GetColumnFamily(
+            *column_family_name[i]);
+        assert(cfd != nullptr);
+        InstallSuperVersionAndScheduleWork(cfd, &sv_context,
+                                           *cfd->GetLatestMutableCFOptions());
 
-      cfd->set_initialized();
+        if (!cfd->mem()->IsSnapshotSupported()) {
+          is_snapshot_supported_ = false;
+        }
 
-      *handle = new ColumnFamilyHandleImpl(cfd, this, &mutex_);
-      ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                     "Created column family [%s] (ID %u)",
-                     column_family_name.c_str(), (unsigned)cfd->GetID());
-    } else {
-      ROCKS_LOG_ERROR(immutable_db_options_.info_log,
-                      "Creating column family [%s] FAILED -- %s",
-                      column_family_name.c_str(), s.ToString().c_str());
+        cfd->set_initialized();
+
+        *handle[i] = new ColumnFamilyHandleImpl(cfd, this, &mutex_);
+        ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                       "Created column family [%s] (ID %u)",
+                       column_family_name[i]->c_str(), (unsigned)cfd->GetID());
+      } else {
+        ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                        "Creating column family [%s] FAILED -- %s",
+                        column_family_name[i]->c_str(),
+                        s[i].ToString().c_str());
+      }
     }
   }  // InstrumentedMutexLock l(&mutex_)
 
   sv_context.Clean();
   // this is outside the mutex
-  if (s.ok()) {
-    NewThreadStatusCfInfo(
-        reinterpret_cast<ColumnFamilyHandleImpl*>(*handle)->cfd());
+  for (size_t i = 0; i < cf_options.size(); ++i) {
+    if (s[i].ok()) {
+      NewThreadStatusCfInfo(
+          reinterpret_cast<ColumnFamilyHandleImpl*>(*handle[i])->cfd());
+    }
   }
   return s;
 }
@@ -3217,8 +3300,8 @@ Status DBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
           status = map_builder.Build(
               {CompactionInputFiles{i, vstorage->LevelFiles(i)}}, deleted_range,
               {}, i /* level */, vstorage->LevelFiles(i)[0]->fd.GetPathId(),
-              cfd, input_version, &edit, nullptr /* file_meta */,
-              nullptr /* porp */, &deleted_files);
+              cfd, false /* optimize_range_deletion */, input_version, &edit,
+              nullptr /* file_meta */, nullptr /* porp */, &deleted_files);
           if (!status.ok()) {
             break;
           }
@@ -3229,7 +3312,8 @@ Status DBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
             }
             status = map_builder.Build(
                 {CompactionInputFiles{i, {f}}}, deleted_range, {},
-                i /* level */, f->fd.GetPathId(), cfd, input_version, &edit,
+                i /* level */, f->fd.GetPathId(), cfd,
+                false /* optimize_range_deletion */, input_version, &edit,
                 nullptr /* file_meta */, nullptr /* porp */, &deleted_files);
             if (!status.ok()) {
               break;

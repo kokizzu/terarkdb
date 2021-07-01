@@ -456,12 +456,11 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "paranoid_file_checks=true;"
       "force_consistency_checks=true;"
       "inplace_update_num_locks=7429;"
-      "optimize_filters_for_hits=false;"
       "level_compaction_dynamic_level_bytes=false;"
       "enable_lazy_compaction=true;"
       "pin_table_properties_in_reader=false;"
       "inplace_update_support=true;"
-      "compaction_style=kCompactionStyleFIFO;"
+      "compaction_style=kCompactionStyleUniversal;"
       "compaction_pri=kMinOverlappingRatio;"
       "hard_pending_compaction_bytes_limit=0;"
       "disable_auto_compactions=false;"
@@ -469,12 +468,14 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "blob_large_key_ratio=0.5;"
       "blob_size=1024;"
       "blob_gc_ratio=0.05;"
+      "target_blob_file_size=0;"
+      "blob_file_defragment_size=0;"
+      "max_dependence_blob_overlap=1024;"
+      "optimize_filters_for_hits=false;"
+      "optimize_range_deletion=false;"
       "report_bg_io_stats=true;"
-      "ttl=60;"
       "ttl_gc_ratio=3.000;"
-      "ttl_max_scan_gap=1;"
-      "compaction_options_fifo={max_table_files_size=3;ttl=100;allow_"
-      "compaction=false;};",
+      "ttl_max_scan_gap=1;",
       new_options));
 
   ASSERT_EQ(unset_bytes_base,

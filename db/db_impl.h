@@ -54,6 +54,7 @@
 #include "rocksdb/write_buffer_manager.h"
 #include "table/scoped_arena_iterator.h"
 #include "util/autovector.h"
+#include "util/chash_set.h"
 #include "util/event_logger.h"
 #include "util/hash.h"
 #include "util/repeatable_thread.h"
@@ -303,6 +304,8 @@ class DBImpl : public DB {
   Status SuggestCompactRange(ColumnFamilyHandle* column_family,
                              const Slice* begin, const Slice* end) override;
 
+  Status SuggestCompactColumnFamily(ColumnFamilyHandle* column_family) override;
+
   Status PromoteL0(ColumnFamilyHandle* column_family,
                    int target_level) override;
 
@@ -381,11 +384,14 @@ class DBImpl : public DB {
   // match to our in-memory records
   virtual Status CheckConsistency(bool read_only);
 
-  Status RunManualCompaction(
-      ColumnFamilyData* cfd, int input_level, int output_level,
-      uint32_t output_path_id, uint32_t max_subcompactions, const Slice* begin,
-      const Slice* end, const std::unordered_set<uint64_t>* files_being_compact,
-      bool exclusive, bool disallow_trivial_move = false);
+  Status RunManualCompaction(ColumnFamilyData* cfd,
+                             SeparationType separation_type, int input_level,
+                             int output_level, uint32_t output_path_id,
+                             uint32_t max_subcompactions, const Slice* begin,
+                             const Slice* end,
+                             const chash_set<uint64_t>* files_being_compact,
+                             bool exclusive,
+                             bool disallow_trivial_move = false);
 
   // Return an internal iterator over the current state of the database.
   // The keys of this iterator are internal keys (see format.h).
@@ -404,9 +410,11 @@ class DBImpl : public DB {
   // Implemented in db_impl_debug.cc
 
   // Compact any files in the named level that overlap [*begin, *end]
-  Status TEST_CompactRange(int level, const Slice* begin, const Slice* end,
-                           ColumnFamilyHandle* column_family = nullptr,
-                           bool disallow_trivial_move = false);
+  Status TEST_CompactRange(
+      int level, const Slice* begin, const Slice* end,
+      ColumnFamilyHandle* column_family = nullptr,
+      SeparationType separation_type = kCompactionTransToSeparate,
+      bool disallow_trivial_move = false);
 
   void TEST_SwitchWAL();
 
@@ -962,16 +970,26 @@ class DBImpl : public DB {
 
   struct WriteContext {
     SuperVersionContext superversion_context;
-    autovector<MemTable*> memtables_to_free_;
+    autovector<MemTable*> memtables_to_free;
+    LogBuffer info_buffer;
+    LogBuffer warn_buffer;
 
-    explicit WriteContext(bool create_superversion = false)
-        : superversion_context(create_superversion) {}
+    explicit WriteContext(Logger* logger, bool create_superversion = false)
+        : superversion_context(create_superversion),
+          info_buffer(InfoLogLevel::INFO_LEVEL, logger),
+          warn_buffer(InfoLogLevel::WARN_LEVEL, logger) {}
+
+    void FlushBufferToLog() {
+      info_buffer.FlushBufferToLog();
+      warn_buffer.FlushBufferToLog();
+    }
 
     ~WriteContext() {
       superversion_context.Clean();
-      for (auto& m : memtables_to_free_) {
+      for (auto& m : memtables_to_free) {
         delete m;
       }
+      FlushBufferToLog();
     }
   };
 
@@ -999,9 +1017,10 @@ class DBImpl : public DB {
 
   const Status CreateArchivalDirectory();
 
-  Status CreateColumnFamilyImpl(const ColumnFamilyOptions& cf_options,
-                                const std::string& cf_name,
-                                ColumnFamilyHandle** handle);
+  autovector<Status> CreateColumnFamilyImpl(
+      autovector<const ColumnFamilyOptions*> cf_options,
+      autovector<const std::string*> cf_name,
+      autovector<ColumnFamilyHandle**> handle);
 
   Status DropColumnFamilyImpl(ColumnFamilyHandle* column_family);
 
@@ -1040,7 +1059,8 @@ class DBImpl : public DB {
                                    const MutableCFOptions& mutable_cf_options,
                                    bool* madeProgress, JobContext* job_context,
                                    SuperVersionContext* superversion_context,
-                                   LogBuffer* log_buffer);
+                                   LogBuffer* log_buffer,
+                                   VersionEdit::ApplyCallback apply_callback);
 
   // Argument required by background flush thread.
   struct BGFlushArg {
@@ -1211,7 +1231,6 @@ class DBImpl : public DB {
                             FlushRequest* req);
 
   void SchedulePendingFlush(const FlushRequest& req, FlushReason flush_reason);
-
   void SchedulePendingCompaction(ColumnFamilyData* cfd);
   void SchedulePendingGarbageCollection(ColumnFamilyData* cfd);
   void SchedulePendingPurge(const std::string& fname,

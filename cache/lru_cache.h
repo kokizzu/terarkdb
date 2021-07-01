@@ -14,7 +14,7 @@
 #include <set>
 #include <sstream>
 #include <string>
-#ifdef WITH_TERARK_ZIP
+#ifdef WITH_DIAGNOSE_CACHE
 #include <terark/heap_ext.hpp>
 #endif  // !NDEBUG
 #include <unordered_map>
@@ -326,7 +326,7 @@ class LRUCacheNoMonitor {
   size_t lru_usage_;
 };
 
-#ifdef WITH_TERARK_ZIP
+#ifdef WITH_DIAGNOSE_CACHE
 class LRUCacheDiagnosableMonitor {
  public:
   struct Options {
@@ -347,17 +347,6 @@ class LRUCacheDiagnosableMonitor {
 
     using DataIdx = size_t;
 
-    struct KeyHash {
-      std::size_t operator()(const Slice& k) const {
-        return Hash(k.data(), k.size(), 0);
-      }
-    };
-
-    struct KeyEqual {
-      bool operator()(const Slice& lhs, const Slice& rhs) const {
-        return lhs.compare(rhs) == 0;
-      }
-    };
     struct ChargeCmp {
       ChargeCmp(std::deque<DataElement>& d) : data_(d) {}
       bool operator()(const DataIdx& l, const DataIdx& r) {
@@ -478,6 +467,8 @@ class LRUCacheDiagnosableMonitor {
         res.append("(" + Slice(e.key).ToString(true) + "," +
                    std::to_string(e.total_charge) + "," +
                    std::to_string(e.count) + ")" + ",");
+        // FIXME code fail here when do recovery, it seems order in my heap is
+        // wrong
         assert(i == 0 ||
                e.total_charge <=
                    data_storage_[data_heap_[last_idx + 1]].total_charge);
@@ -502,7 +493,7 @@ class LRUCacheDiagnosableMonitor {
     const std::deque<DataElement>& TEST_get_elements_storage() {
       return data_storage_;
     }
-    const std::unordered_map<Slice, DataIdx, KeyHash, KeyEqual>&
+    const std::unordered_map<Slice, DataIdx, SliceHasher>&
     TEST_get_elements_map() {
       return key_map_;
     }
@@ -523,7 +514,7 @@ class LRUCacheDiagnosableMonitor {
 
    private:
     size_t k_;
-    std::unordered_map<Slice, DataIdx, KeyHash, KeyEqual> key_map_;
+    std::unordered_map<Slice, DataIdx, SliceHasher> key_map_;
     std::deque<DataElement> data_storage_;
     std::vector<DataIdx> data_heap_;
 

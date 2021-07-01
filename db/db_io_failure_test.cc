@@ -43,6 +43,7 @@ TEST_F(DBIOFailureTest, DropWrites) {
             break;
           }
           dbfull()->TEST_CompactRange(level, nullptr, nullptr, nullptr,
+                                      kCompactionTransToSeparate,
                                       true /* disallow trivial move */);
         }
       } else {
@@ -109,6 +110,7 @@ TEST_F(DBIOFailureTest, NoSpaceCompactRange) {
     env_->no_space_.store(true, std::memory_order_release);
 
     Status s = dbfull()->TEST_CompactRange(0, nullptr, nullptr, nullptr,
+                                           kCompactionTransToSeparate,
                                            true /* disallow trivial move */);
     ASSERT_TRUE(s.IsIOError());
     ASSERT_TRUE(s.IsNoSpace());

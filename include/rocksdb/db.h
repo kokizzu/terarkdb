@@ -681,12 +681,6 @@ class DB {
     //  "rocksdb.is-write-stopped" - Return 1 if write has been stopped.
     static const std::string kIsWriteStopped;
 
-    //  "rocksdb.estimate-oldest-key-time" - returns an estimation of
-    //      oldest key timestamp in the DB. Currently only available for
-    //      FIFO compaction with
-    //      compaction_options_fifo.allow_compaction = false.
-    static const std::string kEstimateOldestKeyTime;
-
     //  "rocksdb.block-cache-capacity" - returns block cache capacity.
     static const std::string kBlockCacheCapacity;
 
@@ -753,7 +747,6 @@ class DB {
   //  "rocksdb.num-running-flushes"
   //  "rocksdb.actual-delayed-write-rate"
   //  "rocksdb.is-write-stopped"
-  //  "rocksdb.estimate-oldest-key-time"
   //  "rocksdb.block-cache-capacity"
   //  "rocksdb.block-cache-usage"
   //  "rocksdb.block-cache-pinned-usage"
@@ -1260,6 +1253,12 @@ class DB {
                                      const Slice* /*begin*/,
                                      const Slice* /*end*/) {
     return Status::NotSupported("SuggestCompactRange() is not implemented.");
+  }
+
+  virtual Status SuggestCompactColumnFamily(
+      ColumnFamilyHandle* /*column_family*/) {
+    return Status::NotSupported(
+        "SuggestCompactColumnFamily() is not implemented.");
   }
 
   virtual Status PromoteL0(ColumnFamilyHandle* /*column_family*/,

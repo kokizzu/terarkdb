@@ -14,9 +14,11 @@
 #include "options/cf_options.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/listener.h"
+#include "rocksdb/options.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/arena.h"
 #include "util/autovector.h"
+#include "util/iterator_cache.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -93,9 +95,9 @@ struct CompactionParams {
   std::vector<FileMetaData*> grandparents;
   bool manual_compaction = false;
   double score = -1;
-  bool deletion_compaction = false;
   bool partial_compaction = false;
   CompactionType compaction_type = kKeyValueCompaction;
+  SeparationType separation_type = kCompactionAutoRebuildBlob;
   std::vector<SelectedRange> input_range = {};
   CompactionReason compaction_reason = CompactionReason::kUnknown;
 
@@ -142,6 +144,7 @@ struct CompactionWorkerContext {
   EncodedString compaction_filter_data;
 
   BlobConfig blob_config;
+  uint32_t separation_type;
   std::string table_factory;
   std::string table_factory_options;
   uint32_t bloom_locality;
@@ -278,14 +281,15 @@ class Compaction {
   // moving a single input file to the next level (no merging or splitting)
   bool IsTrivialMove() const;
 
-  // If true, then the compaction can be done by simply deleting input files.
-  bool deletion_compaction() const { return deletion_compaction_; }
-
   // If true, then enable partial compaction
   bool partial_compaction() const { return partial_compaction_; }
 
   // CompactionType
   CompactionType compaction_type() const { return compaction_type_; }
+
+  // SeparationType
+  SeparationType separation_type() const { return separation_type_; }
+  void set_separation_type(SeparationType st) { separation_type_ = st; }
 
   // Range limit for inputs
   std::vector<SelectedRange>& input_range() { return input_range_; };
@@ -432,6 +436,7 @@ class Compaction {
     return transient_stat_;
   }
   std::vector<TableTransientStat>& transient_stat() { return transient_stat_; }
+  std::unordered_map<uint64_t, uint64_t>& current_blob_overlap_scores() const;
 
  private:
   // mark (or clear) all files that are being compacted
@@ -465,13 +470,15 @@ class Compaction {
   const uint32_t output_path_id_;
   CompressionType output_compression_;
   CompressionOptions output_compression_opts_;
-  // If true, then the comaction can be done by simply deleting input files.
-  const bool deletion_compaction_;
+
   // If true, then enable partial compaction
   const bool partial_compaction_;
 
-  // If true, then output map sst
+  //
   const CompactionType compaction_type_;
+
+  //
+  SeparationType separation_type_;
 
   // Range limit for inputs
   std::vector<SelectedRange> input_range_;
@@ -530,5 +537,13 @@ class Compaction {
 extern uint64_t TotalFileSize(const std::vector<FileMetaData*>& files);
 
 extern const char* CompactionTypeName(CompactionType type);
+
+extern Status BuildInheritanceTree(
+    const std::vector<CompactionInputFiles>& inputs,
+    const DependenceMap& dependence_map, const Version* version,
+    std::vector<uint64_t>* tree, size_t* pruge_count);
+
+extern std::vector<uint64_t> InheritanceTreeToSet(
+    const std::vector<uint64_t>& tree);
 
 }  // namespace TERARKDB_NAMESPACE

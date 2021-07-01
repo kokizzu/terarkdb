@@ -45,7 +45,7 @@ class ChaosTest {
 
   void DumpCacheStatistics() {
     auto dcache =
-#ifdef WITH_TERARK_ZIP
+#ifdef WITH_DIAGNOSE_CACHE
         dynamic_cast<DiagnosableLRUCache *>(bbto.block_cache.get());
 #else
         dynamic_cast<LRUCache *>(bbto.block_cache.get());
@@ -57,7 +57,7 @@ class ChaosTest {
       auto info = dcache->DumpLRUCacheStatistics();
       std::cout << info << std::endl;
       using namespace std::chrono;
-      std::this_thread::sleep_for(60s);
+      std::this_thread::sleep_for(seconds(60));
     }
   }
 
@@ -66,6 +66,7 @@ class ChaosTest {
     options.allow_mmap_reads = false;
     options.max_open_files = 8192;
     options.allow_fallocate = true;
+    options.max_dependence_blob_overlap = 3;
     options.writable_file_max_buffer_size = 1048576;
     options.allow_mmap_writes = false;
     options.allow_concurrent_memtable_write = true;
@@ -135,7 +136,7 @@ class ChaosTest {
     bbto.pin_top_level_index_and_filter = true;
     bbto.pin_l0_filter_and_index_blocks_in_cache = true;
     bbto.filter_policy.reset(NewBloomFilterPolicy(10, true));
-#ifdef WITH_TERARK_ZIP
+#ifdef WITH_DIAGNOSE_CACHE
     bbto.block_cache =
         NewDiagnosableLRUCache(4ULL << 30, 3, false, 0.2, nullptr, 10);
 #else
@@ -165,7 +166,7 @@ class ChaosTest {
     options.min_write_buffer_number_to_merge = 1;
     options.max_write_buffer_number_to_maintain = 16;
     options.max_write_buffer_number = 8;
-    options.max_compaction_bytes = file_size_base * 2;
+    options.max_compaction_bytes = file_size_base * 4;
     options.memtable_prefix_bloom_size_ratio = 0.000000;
     options.hard_pending_compaction_bytes_limit = 274877906944;
     options.prefix_extractor = nullptr;
@@ -173,12 +174,12 @@ class ChaosTest {
     options.paranoid_file_checks = false;
     options.max_bytes_for_level_multiplier = 2.000000;
     options.optimize_filters_for_hits = false;
+    options.optimize_range_deletion = false;
     options.level_compaction_dynamic_level_bytes = true;
     options.inplace_update_num_locks = 10000;
     options.inplace_update_support = false;
     options.blob_gc_ratio = 0.05;
     options.blob_size = blob_size;
-    options.ttl = 0;
     options.soft_pending_compaction_bytes_limit = 68719476736;
     options.enable_lazy_compaction = true;
     options.disable_auto_compactions = false;
@@ -819,8 +820,9 @@ class ChaosTest {
       options.compaction_style = TERARKDB_NAMESPACE::kCompactionStyleLevel;
       options.write_buffer_size = size_t(file_size_base / 1.1);
       options.enable_lazy_compaction = true;
-      //bbto.block_cache = NewLRUCache(4ULL << 30, 6, false);
-      options.table_factory.reset(TERARKDB_NAMESPACE::NewBlockBasedTableFactory(bbto));
+      // bbto.block_cache = NewLRUCache(4ULL << 30, 6, false);
+      options.table_factory.reset(
+          TERARKDB_NAMESPACE::NewBlockBasedTableFactory(bbto));
       cfDescriptors.emplace_back("level" + std::to_string(i), options);
     }
     if (flags_ & TestWorker) {

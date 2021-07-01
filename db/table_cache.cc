@@ -56,6 +56,35 @@ static Slice GetSliceForFileNumber(const uint64_t* file_number) {
                sizeof(*file_number));
 }
 
+static bool InheritanceMismatch(const FileMetaData& sst_meta,
+                                const FileMetaData& blob_meta) {
+  assert(std::is_sorted(sst_meta.prop.dependence.begin(),
+                        sst_meta.prop.dependence.end(),
+                        TERARK_CMP(file_number, <)));
+  assert(std::is_sorted(blob_meta.prop.inheritance.begin(),
+                        blob_meta.prop.inheritance.end()));
+
+  auto sst_begin = sst_meta.prop.dependence.begin(),
+       sst_end = sst_meta.prop.dependence.end();
+  if (std::binary_search(sst_begin, sst_end,
+                         Dependence{blob_meta.fd.GetNumber(), 0},
+                         TERARK_CMP(file_number, <))) {
+    return false;
+  }
+  auto blob_begin = blob_meta.prop.inheritance.begin(),
+       blob_end = blob_meta.prop.inheritance.end();
+  while (sst_begin != sst_end && blob_begin != blob_end) {
+    if (sst_begin->file_number == *blob_begin) {
+      return false;
+    } else if (sst_begin->file_number < *blob_begin) {
+      ++sst_begin;
+    } else {
+      ++blob_begin;
+    }
+  }
+  return true;
+}
+
 // Store params for create depend table iterator in future
 class LazyCreateIterator : public Snapshot {
   TableCache* table_cache_;
@@ -429,7 +458,22 @@ Status TableCache::Get(const ReadOptions& options,
                        GetContext* get_context,
                        const SliceTransform* prefix_extractor,
                        HistogramImpl* file_read_hist, bool skip_filters,
-                       int level) {
+                       int level, const FileMetaData* inheritance) {
+  if (inheritance != nullptr) {
+    // fast path for GC
+    RecordTick(ioptions_.statistics, GC_TOUCH_FILES);
+    SequenceNumber ikey_seq = GetInternalKeySeqno(k);
+    if (ikey_seq < file_meta.fd.smallest_seqno ||
+        ikey_seq > file_meta.fd.largest_seqno) {
+      RecordTick(ioptions_.statistics, GC_SKIP_GET_BY_SEQ);
+      return Status::OK();
+    }
+    if (!file_meta.prop.is_map_sst() &&
+        InheritanceMismatch(file_meta, *inheritance)) {
+      RecordTick(ioptions_.statistics, GC_SKIP_GET_BY_FILE);
+      return Status::OK();
+    }
+  }
   auto& fd = file_meta.fd;
   IterKey key_buffer;
   Status s;
@@ -545,7 +589,7 @@ Status TableCache::Get(const ReadOptions& options,
           assert(find->second->fd.GetNumber() == file_number);
           s = Get(forward_options, internal_comparator, *find->second,
                   dependence_map, find_k, get_context, prefix_extractor,
-                  file_read_hist, skip_filters, level);
+                  file_read_hist, skip_filters, level, inheritance);
 
           if (!s.ok() || get_context->is_finished()) {
             // error or found, recovery min_seq_type_backup is unnecessary

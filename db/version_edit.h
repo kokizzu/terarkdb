@@ -43,6 +43,7 @@ struct FileDescriptor {
   SequenceNumber largest_seqno;   // The largest seqno in this file
 
   FileDescriptor() : FileDescriptor(0, 0, 0) {}
+  FileDescriptor(const FileDescriptor&) = default;
 
   FileDescriptor(uint64_t number, uint32_t path_id, uint64_t _file_size)
       : FileDescriptor(number, path_id, _file_size, kMaxSequenceNumber, 0) {}
@@ -55,14 +56,7 @@ struct FileDescriptor {
         smallest_seqno(_smallest_seqno),
         largest_seqno(_largest_seqno) {}
 
-  FileDescriptor& operator=(const FileDescriptor& fd) {
-    table_reader = fd.table_reader;
-    packed_number_and_path_id = fd.packed_number_and_path_id;
-    file_size = fd.file_size;
-    smallest_seqno = fd.smallest_seqno;
-    largest_seqno = fd.largest_seqno;
-    return *this;
-  }
+  FileDescriptor& operator=(const FileDescriptor&) = default;
 
   uint64_t GetNumber() const {
     return packed_number_and_path_id & kFileNumberMask;
@@ -92,16 +86,16 @@ struct TablePropertyCache {
     kHasSnapshots = 1ULL << 1,
     kNoRangeDeletions = 1ULL << 2,
   };
-  uint64_t num_entries = 0;                 // the number of entries.
-  uint64_t num_deletions = 0;               // the number of deletion entries.
-  uint64_t raw_key_size = 0;                // total uncompressed key size.
-  uint64_t raw_value_size = 0;              // total uncompressed value size.
-  uint8_t flags = 0;                        // save flags
-  uint8_t purpose = 0;                      // zero for essence sst
-  uint16_t max_read_amp = 1;                // max read amp from sst
-  float read_amp = 1;                       // expt read amp from sst
-  std::vector<Dependence> dependence;       // make these sst hidden
-  std::vector<uint64_t> inheritance_chain;  // inheritance chain
+  uint64_t num_entries = 0;            // the number of entries.
+  uint64_t num_deletions = 0;          // the number of deletion entries.
+  uint64_t raw_key_size = 0;           // total uncompressed key size.
+  uint64_t raw_value_size = 0;         // total uncompressed value size.
+  uint8_t flags = 0;                   // save flags
+  uint8_t purpose = 0;                 // zero for essence sst
+  uint16_t max_read_amp = 1;           // max read amp from sst
+  float read_amp = 1;                  // expt read amp from sst
+  std::vector<Dependence> dependence;  // make these sst hidden
+  std::vector<uint64_t> inheritance;   // inheritance set
   uint64_t earliest_time_begin_compact = port::kMaxUint64;
   uint64_t latest_time_end_compact = port::kMaxUint64;
 
@@ -248,7 +242,18 @@ struct LevelFilesBrief {
 class VersionEdit {
  public:
   VersionEdit() { Clear(); }
-  ~VersionEdit() {}
+  ~VersionEdit() = default;
+
+  struct ApplyCallback {
+    void (*callback)(void*, const Status&);
+    void* args;
+
+    operator bool() const { return callback != nullptr; }
+    void operator()(const Status& s) const {
+      assert(callback != nullptr);
+      callback(args, s);
+    }
+  };
 
   void Clear();
 
@@ -319,8 +324,13 @@ class VersionEdit {
 
   void SetApplyCallback(void (*apply_callback)(void*, const Status&),
                         void* apply_callback_arg) {
-    apply_callback_ = apply_callback;
-    apply_callback_arg_ = apply_callback_arg;
+    assert(apply_callback != nullptr);
+    apply_callback_vec_.emplace_back(
+        ApplyCallback{apply_callback, apply_callback_arg});
+  }
+  void SetApplyCallback(ApplyCallback callback) {
+    assert(callback);
+    apply_callback_vec_.emplace_back(callback);
   }
 
   // Number of edits
@@ -364,8 +374,8 @@ class VersionEdit {
     return new_files_;
   }
   void DoApplyCallback(const Status& s) {
-    if (apply_callback_ != nullptr) {
-      apply_callback_(apply_callback_arg_, s);
+    for (auto& apply_callback : apply_callback_vec_) {
+      apply_callback(s);
     }
   }
 
@@ -405,8 +415,9 @@ class VersionEdit {
 
   DeletedFileSet deleted_files_;
   std::vector<std::pair<int, FileMetaData>> new_files_;
-  void (*apply_callback_)(void*, const Status&);
-  void* apply_callback_arg_;
+
+  //
+  autovector<ApplyCallback, 2> apply_callback_vec_;
 
   // Each version edit record should have column_family_ set
   // If it's not set, it is default (0)

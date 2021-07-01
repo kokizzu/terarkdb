@@ -18,6 +18,7 @@
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/terark_namespace.h"
 #include "table/iterator_wrapper.h"
+#include "util/chash_set.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -33,6 +34,9 @@ class CompactionIterator {
         : compaction_(compaction) {}
 
     virtual ~CompactionProxy() = default;
+    virtual SeparationType separation_type() const {
+      return compaction_->separation_type();
+    }
     virtual int level(size_t /*compaction_input_level*/ = 0) const {
       return compaction_->level();
     }
@@ -73,7 +77,8 @@ class CompactionIterator {
                      BlobConfig blob_config = BlobConfig{size_t(-1), 0.0},
                      const CompactionFilter* compaction_filter = nullptr,
                      const std::atomic<bool>* shutting_down = nullptr,
-                     const SequenceNumber preserve_deletes_seqnum = 0);
+                     const SequenceNumber preserve_deletes_seqnum = 0,
+                     const chash_set<uint64_t>* b = nullptr);
 
   // Constructor with custom CompactionProxy, used for tests.
   CompactionIterator(InternalIterator* input, SeparateHelper* separate_helper,
@@ -88,7 +93,8 @@ class CompactionIterator {
                      BlobConfig blob_config,
                      const CompactionFilter* compaction_filter = nullptr,
                      const std::atomic<bool>* shutting_down = nullptr,
-                     const SequenceNumber preserve_deletes_seqnum = 0);
+                     const SequenceNumber preserve_deletes_seqnum = 0,
+                     const chash_set<uint64_t>* b = nullptr);
 
   ~CompactionIterator();
 
@@ -214,8 +220,14 @@ class CompactionIterator {
   // uncommitted values by providing a SnapshotChecker object.
   bool current_key_committed_;
 
+  bool do_separate_value_;  // separate big value
+  bool do_rebuild_blob_;    // rebuild all blobs in need_rebuild_blobs if user
+                            // force rebuild need_rebuild_blobs.empty() == true
+  bool do_combine_value_;   // fetch and combine bigvalue from blobs
+
   size_t filter_sample_interval_ = 64;
   size_t filter_hit_count_ = 0;
+  const chash_set<uint64_t>* rebuild_blob_set_;
 
  public:
   bool IsShuttingDown() {

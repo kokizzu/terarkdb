@@ -11,6 +11,7 @@
 #include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/experimental.h"
+#include "rocksdb/options.h"
 #include "rocksdb/terark_namespace.h"
 #include "rocksdb/utilities/convenience.h"
 #include "util/fault_injection_test_env.h"
@@ -867,6 +868,7 @@ TEST_P(DBCompactionTestWithParam, CompactionsGenerateMultipleFiles) {
   // Reopening moves updates to level-0
   ReopenWithColumnFamilies({"default", "pikachu"}, options);
   dbfull()->TEST_CompactRange(0, nullptr, nullptr, handles_[1],
+                              kCompactionTransToSeparate,
                               true /* disallow trivial move */);
 
   ASSERT_EQ(NumTableFilesAtLevel(0, 1), 0);
@@ -1373,11 +1375,16 @@ TEST_P(DBCompactionTestWithParam, ManualCompactionPartial) {
 
   // 1 files in L0
   ASSERT_EQ("1,0,0,0,0,0,2", FilesPerLevel(0));
-  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr, nullptr, false));
-  ASSERT_OK(dbfull()->TEST_CompactRange(1, nullptr, nullptr, nullptr, false));
-  ASSERT_OK(dbfull()->TEST_CompactRange(2, nullptr, nullptr, nullptr, false));
-  ASSERT_OK(dbfull()->TEST_CompactRange(3, nullptr, nullptr, nullptr, false));
-  ASSERT_OK(dbfull()->TEST_CompactRange(4, nullptr, nullptr, nullptr, false));
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr, nullptr,
+                                        kCompactionTransToSeparate, false));
+  ASSERT_OK(dbfull()->TEST_CompactRange(1, nullptr, nullptr, nullptr,
+                                        kCompactionTransToSeparate, false));
+  ASSERT_OK(dbfull()->TEST_CompactRange(2, nullptr, nullptr, nullptr,
+                                        kCompactionTransToSeparate, false));
+  ASSERT_OK(dbfull()->TEST_CompactRange(3, nullptr, nullptr, nullptr,
+                                        kCompactionTransToSeparate, false));
+  ASSERT_OK(dbfull()->TEST_CompactRange(4, nullptr, nullptr, nullptr,
+                                        kCompactionTransToSeparate, false));
   // 2 files in L6, 1 file in L5
   ASSERT_EQ("0,0,0,0,0,1,2", FilesPerLevel(0));
 
@@ -1513,7 +1520,8 @@ TEST_F(DBCompactionTest, DISABLED_ManualPartialFill) {
 
   // 2 files in L2, 1 in L0
   ASSERT_EQ("1,0,2", FilesPerLevel(0));
-  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr, nullptr, false));
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr, nullptr,
+                                        kCompactionTransToSeparate, false));
   // 2 files in L2, 1 in L1
   ASSERT_EQ("0,1,2", FilesPerLevel(0));
 
@@ -3526,115 +3534,6 @@ TEST_F(DBCompactionTest, CompactBottomLevelFilesWithDeletions) {
   TERARKDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
-TEST_F(DBCompactionTest, LevelCompactExpiredTtlFiles) {
-  const int kNumKeysPerFile = 32;
-  const int kNumLevelFiles = 2;
-  const int kValueSize = 1024;
-
-  Options options = CurrentOptions();
-  options.compression = kNoCompression;
-  options.ttl = 24 * 60 * 60;  // 24 hours
-  options.max_open_files = -1;
-  env_->time_elapse_only_sleep_ = false;
-  options.env = env_;
-
-  env_->addon_time_.store(0);
-  DestroyAndReopen(options);
-
-  Random rnd(301);
-  for (int i = 0; i < kNumLevelFiles; ++i) {
-    for (int j = 0; j < kNumKeysPerFile; ++j) {
-      ASSERT_OK(
-          Put(Key(i * kNumKeysPerFile + j), RandomString(&rnd, kValueSize)));
-    }
-    Flush();
-  }
-  dbfull()->TEST_WaitForCompact();
-  MoveFilesToLevel(3);
-  ASSERT_EQ("0,0,0,2", FilesPerLevel());
-
-  // Delete previously written keys.
-  for (int i = 0; i < kNumLevelFiles; ++i) {
-    for (int j = 0; j < kNumKeysPerFile; ++j) {
-      ASSERT_OK(Delete(Key(i * kNumKeysPerFile + j)));
-    }
-    Flush();
-  }
-  dbfull()->TEST_WaitForCompact();
-  ASSERT_EQ("2,0,0,2", FilesPerLevel());
-  MoveFilesToLevel(1);
-  ASSERT_EQ("0,2,0,2", FilesPerLevel());
-
-  env_->addon_time_.fetch_add(36 * 60 * 60);  // 36 hours
-  ASSERT_EQ("0,2,0,2", FilesPerLevel());
-
-  // Just do a simple write + flush so that the Ttl expired files get
-  // compacted.
-  ASSERT_OK(Put("a", "1"));
-  Flush();
-  TERARKDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
-        Compaction* compaction = reinterpret_cast<Compaction*>(arg);
-        ASSERT_TRUE(compaction->compaction_reason() == CompactionReason::kTtl);
-      });
-  TERARKDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
-  dbfull()->TEST_WaitForCompact();
-  // All non-L0 files are deleted, as they contained only deleted data.
-  ASSERT_EQ("1", FilesPerLevel());
-  TERARKDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
-
-  // Test dynamically changing ttl.
-
-  env_->addon_time_.store(0);
-  DestroyAndReopen(options);
-
-  for (int i = 0; i < kNumLevelFiles; ++i) {
-    for (int j = 0; j < kNumKeysPerFile; ++j) {
-      ASSERT_OK(
-          Put(Key(i * kNumKeysPerFile + j), RandomString(&rnd, kValueSize)));
-    }
-    Flush();
-  }
-  dbfull()->TEST_WaitForCompact();
-  MoveFilesToLevel(3);
-  ASSERT_EQ("0,0,0,2", FilesPerLevel());
-
-  // Delete previously written keys.
-  for (int i = 0; i < kNumLevelFiles; ++i) {
-    for (int j = 0; j < kNumKeysPerFile; ++j) {
-      ASSERT_OK(Delete(Key(i * kNumKeysPerFile + j)));
-    }
-    Flush();
-  }
-  dbfull()->TEST_WaitForCompact();
-  ASSERT_EQ("2,0,0,2", FilesPerLevel());
-  MoveFilesToLevel(1);
-  ASSERT_EQ("0,2,0,2", FilesPerLevel());
-
-  // Move time forward by 12 hours, and make sure that compaction still doesn't
-  // trigger as ttl is set to 24 hours.
-  env_->addon_time_.fetch_add(12 * 60 * 60);
-  ASSERT_OK(Put("a", "1"));
-  Flush();
-  dbfull()->TEST_WaitForCompact();
-  ASSERT_EQ("1,2,0,2", FilesPerLevel());
-
-  TERARKDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
-        Compaction* compaction = reinterpret_cast<Compaction*>(arg);
-        ASSERT_TRUE(compaction->compaction_reason() == CompactionReason::kTtl);
-      });
-  TERARKDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
-
-  // Dynamically change ttl to 10 hours.
-  // This should trigger a ttl compaction, as 12 hours have already passed.
-  ASSERT_OK(dbfull()->SetOptions({{"ttl", "36000"}}));
-  dbfull()->TEST_WaitForCompact();
-  // All non-L0 files are deleted, as they contained only deleted data.
-  ASSERT_EQ("1", FilesPerLevel());
-  TERARKDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
-}
-
 TEST_F(DBCompactionTest, CompactRangeDelayedByL0FileCount) {
   // Verify that, when `CompactRangeOptions::allow_write_stall == false`, manual
   // compaction only triggers flush after it's sure stall won't be triggered for
@@ -4274,6 +4173,145 @@ TEST_P(DBCompactionTestWithParam, FixFileIngestionCompactionDeadlock) {
   ingestion_thr.join();
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
   Close();
+}
+
+TEST_F(DBCompactionTest, BlobOverlapThredhold) {
+  std::string bigval =
+      "012345678901234567890123456789012345678901234567890123456789012345678901"
+      "23456789012345678901234567890123456789";
+  std::string normal_val = "0123456789";
+  Options opts = CurrentOptions();
+  opts.level0_file_num_compaction_trigger = 3;
+  opts.compression = kNoCompression;
+  opts.blob_size = 32;  // turn on kv separation
+
+  opts.max_dependence_blob_overlap = 3;
+
+  // gc job banned
+  TERARKDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ProcessGarbageCollection::Start",
+      [&](void* arg) { *(bool*)arg = true; });
+  TERARKDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  auto verify_scores = [](const std::unordered_map<uint64_t, uint64_t>& scores,
+                          std::string expect_scores) {
+    std::multiset<uint64_t> score_set;
+    for (auto var : scores) {
+      score_set.insert(var.second);
+    }
+    std::string score_str;
+    for (auto var : score_set) {
+      score_str.append(std::to_string(var));
+      score_str.append(",");
+    }
+    SCOPED_TRACE("get: " + score_str + ", expect: " + expect_scores);
+    return score_str.compare(expect_scores) == 0;
+  };
+
+  DestroyAndReopen(opts);
+
+  int i;
+  for (i = 0; i < 2000; ++i) {
+    Put(Key(i), bigval);
+  }
+  Flush();
+  for (i = 1000; i < 3000; ++i) {
+    Put(Key(i), bigval);
+  }
+  Flush();
+  for (i = 2500; i < 3500; ++i) {
+    Put(Key(i), bigval);
+  }
+  Flush();
+
+  dbfull()->TEST_WaitForCompact();
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(-1), 3);
+
+  auto blob_overlap_scores = dbfull()
+                                 ->TEST_GetVersionSet()
+                                 ->GetColumnFamilySet()
+                                 ->GetColumnFamily("default")
+                                 ->current()
+                                 ->storage_info()
+                                 ->blob_overlap_scores();
+  ASSERT_TRUE(verify_scores(blob_overlap_scores, "2,2,3,"));
+
+  for (i = 3400; i < 4500; ++i) {
+    Put(Key(i), bigval);
+  }
+  Flush();
+  for (i = 3200; i < 4000; ++i) {
+    Put(Key(i), bigval);
+  }
+  Flush();
+  for (i = 100; i < 999; ++i) {
+    Put(Key(i), bigval);
+  }
+  Flush();
+
+  dbfull()->TEST_WaitForCompact();
+
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+  // old sst file in level-1 can be remove , only leave 6(3+3) blob file which
+  // is origin flush sst
+  ASSERT_EQ(NumTableFilesAtLevel(-1), 6);
+
+  auto blob_overlap_scores2 = dbfull()
+                                  ->TEST_GetVersionSet()
+                                  ->GetColumnFamilySet()
+                                  ->GetColumnFamily("default")
+                                  ->current()
+                                  ->storage_info()
+                                  ->blob_overlap_scores();
+  ASSERT_TRUE(verify_scores(blob_overlap_scores2, "2,3,3,3,3,4,"));
+
+  // now we have 6 blobs:
+  // 8: [0,              2000)
+  // 11:             [1000,         3000)
+  // 13:                        [2500,       3500)
+  // 16:                                     [3400,        4500)
+  // 18:                                   [3200,   4000)
+  // 20:  [100,999)
+  // overlap range is [3400, 3500) which contains 3 files (13,16,18)
+  TERARKDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "Compaction::GetRebuildNeededBlobs::End", [&](void* arg) {
+        chash_set<uint64_t>* rebuild_blob_set = (chash_set<uint64_t>*)arg;
+        std::string expect =
+            "13,18,16,";  // TODO filenumber is not stable , future ut may fail
+                          // here when change flush logic
+        std::string we_get;
+        for (auto blob : *rebuild_blob_set) {
+          we_get.append(std::to_string(blob) + ",");
+        }
+        ASSERT_EQ(expect, we_get);
+      });
+  TERARKDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::FinishCompactionOutputBlob::Start", [&](void* arg) {
+        FileMetaData* meta = (FileMetaData*)arg;
+        ASSERT_EQ(meta->smallest.user_key().ToString(), Key(2500));
+        ASSERT_EQ(meta->largest.user_key().ToString(), Key(4499));
+      });
+  TERARKDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  // flush 3 normal sst to triger compaction with level-1, so that rebuild
+  // overlap blob
+  for (i = 500; i < 600; ++i) {
+    Put(Key(i), normal_val);
+  }
+  Flush();
+  for (i = 600; i < 700; ++i) {
+    Put(Key(i), normal_val);
+  }
+  Flush();
+  for (i = 700; i < 800; ++i) {
+    Put(Key(i), normal_val);
+  }
+  Flush();
+
+  dbfull()->TEST_WaitForCompact();
 }
 
 #endif  // !defined(ROCKSDB_LITE)

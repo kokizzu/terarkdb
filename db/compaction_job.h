@@ -99,6 +99,8 @@ class CompactionJob {
   // REQUIRED: mutex held
   Status Install(const MutableCFOptions& mutable_cf_options);
 
+  SeparationType separation_type() const;
+
   struct ProcessArg {
     CompactionJob* job;
     int task_id;
@@ -131,7 +133,7 @@ class CompactionJob {
       const Slice* next_table_min_key = nullptr);
   Status FinishCompactionOutputBlob(
       const Status& input_status, SubcompactionState* sub_compact,
-      const std::vector<uint64_t>& inheritance_chain);
+      const std::vector<uint64_t>& inheritance_tree);
   Status InstallCompactionResults(const MutableCFOptions& mutable_cf_options);
   void RecordCompactionIOStats();
   Status OpenCompactionOutputFile(SubcompactionState* sub_compact);

@@ -77,7 +77,6 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
       compaction_style(options.compaction_style),
       compaction_pri(options.compaction_pri),
       compaction_options_universal(options.compaction_options_universal),
-      compaction_options_fifo(options.compaction_options_fifo),
       max_sequential_skip_in_iterations(
           options.max_sequential_skip_in_iterations),
       memtable_factory(options.memtable_factory),
@@ -85,10 +84,10 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
           options.table_properties_collector_factories),
       max_successive_merges(options.max_successive_merges),
       optimize_filters_for_hits(options.optimize_filters_for_hits),
+      optimize_range_deletion(options.optimize_range_deletion),
       paranoid_file_checks(options.paranoid_file_checks),
       force_consistency_checks(options.force_consistency_checks),
-      report_bg_io_stats(options.report_bg_io_stats),
-      ttl(options.ttl) {
+      report_bg_io_stats(options.report_bg_io_stats) {
   assert(memtable_factory.get() != nullptr);
   if (max_bytes_for_level_multiplier_additional.size() <
       static_cast<unsigned int>(num_levels)) {
@@ -259,6 +258,18 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    blob_large_key_ratio);
   ROCKS_LOG_HEADER(log, "                          Options.blob_gc_ratio: %f",
                    blob_gc_ratio);
+  ROCKS_LOG_HEADER(log,
+                   "                  Options.target_blob_file_size: %" PRIu64,
+                   target_blob_file_size);
+  ROCKS_LOG_HEADER(log,
+                   "              Options.blob_file_defragment_size: %" PRIu64,
+                   blob_file_defragment_size);
+  ROCKS_LOG_HEADER(log, "            Options.max_dependence_blob_overlap: %zu",
+                   max_dependence_blob_overlap);
+  ROCKS_LOG_HEADER(log, "                           Options.ttl_gc_ratio: %f",
+                   ttl_gc_ratio);
+  ROCKS_LOG_HEADER(log, "                       Options.ttl_max_scan_gap: %zd",
+                   ttl_max_scan_gap);
 
   const auto& it_compaction_style =
       compaction_style_to_string.find(compaction_style);
@@ -309,13 +320,6 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
   }
   ROCKS_LOG_HEADER(log, " Options.compaction_options_universal.stop_style: %s",
                    str_compaction_stop_style.c_str());
-  ROCKS_LOG_HEADER(
-      log, "Options.compaction_options_fifo.max_table_files_size: %" PRIu64,
-      compaction_options_fifo.max_table_files_size);
-  ROCKS_LOG_HEADER(log, "Options.compaction_options_fifo.allow_compaction: %d",
-                   compaction_options_fifo.allow_compaction);
-  ROCKS_LOG_HEADER(log, "Options.compaction_options_fifo.ttl: %" PRIu64,
-                   compaction_options_fifo.ttl);
   std::string collector_names;
   for (const auto& collector_factory : table_properties_collector_factories) {
     collector_names.append(collector_factory->Name());
@@ -347,14 +351,14 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
       max_successive_merges);
   ROCKS_LOG_HEADER(log, "              Options.optimize_filters_for_hits: %d",
                    optimize_filters_for_hits);
+  ROCKS_LOG_HEADER(log, "                Options.optimize_range_deletion: %d",
+                   optimize_range_deletion);
   ROCKS_LOG_HEADER(log, "                   Options.paranoid_file_checks: %d",
                    paranoid_file_checks);
   ROCKS_LOG_HEADER(log, "               Options.force_consistency_checks: %d",
                    force_consistency_checks);
   ROCKS_LOG_HEADER(log, "                     Options.report_bg_io_stats: %d",
                    report_bg_io_stats);
-  ROCKS_LOG_HEADER(log, "                                    Options.ttl: %d",
-                   ttl);
 }  // ColumnFamilyOptions::Dump
 
 void Options::Dump(Logger* log) const {

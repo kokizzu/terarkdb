@@ -299,7 +299,7 @@ void RandomInitDBOptions(DBOptions* db_opt, Random* rnd) {
 }
 
 void RandomInitCFOptions(ColumnFamilyOptions* cf_opt, Random* rnd) {
-  cf_opt->compaction_style = (CompactionStyle)(rnd->Uniform(4));
+  cf_opt->compaction_style = (CompactionStyle)(rnd->Uniform(3));
 
   // boolean options
   cf_opt->report_bg_io_stats = rnd->Uniform(2);
@@ -309,10 +309,11 @@ void RandomInitCFOptions(ColumnFamilyOptions* cf_opt, Random* rnd) {
   cf_opt->inplace_update_support = rnd->Uniform(2);
   cf_opt->level_compaction_dynamic_level_bytes = rnd->Uniform(2);
   cf_opt->optimize_filters_for_hits = rnd->Uniform(2);
+  // optimize_range_deletion change in SanitizeOptions, get will not get same
+  // result cf_opt->optimize_range_deletion =  rnd->Uniform(2);
   cf_opt->paranoid_file_checks = rnd->Uniform(2);
   cf_opt->purge_redundant_kvs_while_flush = rnd->Uniform(2);
   cf_opt->force_consistency_checks = rnd->Uniform(2);
-  cf_opt->compaction_options_fifo.allow_compaction = rnd->Uniform(2);
 
   // double options
   cf_opt->hard_rate_limit = static_cast<double>(rnd->Uniform(10000)) / 13;
@@ -352,14 +353,10 @@ void RandomInitCFOptions(ColumnFamilyOptions* cf_opt, Random* rnd) {
 
   // uint64_t options
   static const uint64_t uint_max = static_cast<uint64_t>(UINT_MAX);
-  cf_opt->ttl = uint_max + rnd->Uniform(10000);
   cf_opt->max_sequential_skip_in_iterations = uint_max + rnd->Uniform(10000);
   cf_opt->target_file_size_base = uint_max + rnd->Uniform(10000);
   cf_opt->max_compaction_bytes =
       cf_opt->target_file_size_base * rnd->Uniform(100);
-  cf_opt->compaction_options_fifo.max_table_files_size =
-      uint_max + rnd->Uniform(10000);
-  cf_opt->compaction_options_fifo.ttl = uint_max + rnd->Uniform(10000);
 
   // unsigned int options
   cf_opt->rate_limit_delay_max_milliseconds = rnd->Uniform(10000);

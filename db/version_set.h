@@ -128,7 +128,6 @@ class VersionStorageInfo {
   // Updates internal structures that keep track of compaction scores
   // We use compaction scores to figure out which compaction to do next
   // REQUIRES: db_mutex held!!
-  // TODO find a better way to pass compaction_options_fifo.
   void ComputeCompactionScore(const ImmutableCFOptions& immutable_cf_options,
                               const MutableCFOptions& mutable_cf_options);
 
@@ -139,15 +138,6 @@ class VersionStorageInfo {
   // This computes files_marked_for_compaction_ and is called by
   // ComputeCompactionScore()
   void ComputeFilesMarkedForCompaction();
-
-  // This computes files_marked_for_compaction_ and is called by
-  // ScheduleTtlGC()
-  void AddFilesMarkedForCompaction(int level, FileMetaData* meta);
-
-  // This computes ttl_expired_files_ and is called by
-  // ComputeCompactionScore()
-  void ComputeExpiredTtlFiles(const ImmutableCFOptions& ioptions,
-                              const uint64_t ttl);
 
   // This computes bottommost_files_marked_for_compaction_ and is called by
   // ComputeCompactionScore() or UpdateOldestSnapshot().
@@ -278,6 +268,10 @@ class VersionStorageInfo {
 
   double total_garbage_ratio() const { return total_garbage_ratio_; }
 
+  bool blob_marked_for_compaction() const {
+    return blob_marked_for_compaction_;
+  }
+
   bool has_space_amplification() const { return !space_amplification_.empty(); }
 
   bool has_space_amplification(int level) const {
@@ -294,6 +288,12 @@ class VersionStorageInfo {
     auto find = space_amplification_.find(level);
     return find != space_amplification_.end() &&
            (find->second & kHasRangeDeletion) != 0;
+  }
+
+  bool has_marked_for_compaction(int level) const {
+    auto find = space_amplification_.find(level);
+    return find != space_amplification_.end() &&
+           (find->second & kMarkedForCompaction) != 0;
   }
 
   void set_read_amplification(const std::vector<double>& read_amp) {
@@ -356,13 +356,6 @@ class VersionStorageInfo {
       const {
     assert(finalized_);
     return files_marked_for_compaction_;
-  }
-
-  // REQUIRES: This version has been saved (see VersionSet::SaveTo)
-  // REQUIRES: DB mutex held during access
-  const autovector<std::pair<int, FileMetaData*>>& ExpiredTtlFiles() const {
-    assert(finalized_);
-    return expired_ttl_files_;
   }
 
   // REQUIRES: This version has been saved (see VersionSet::SaveTo)
@@ -492,6 +485,20 @@ class VersionStorageInfo {
                                      const Slice& largest_user_key,
                                      int last_level, int last_l0_idx);
 
+  VersionBuilder::Context* ReleaseVersionBuilderContext() {
+    return version_builder_context_.release();
+  }
+  void ResetVersionBuilderContext(VersionBuilder::Context* context) {
+    return version_builder_context_.reset(context);
+  }
+  uint64_t blob_file_count() { return blob_file_count_; }
+  void CalculateTopkGarbageBlobs();
+  void ComputeBlobOverlapScore();
+
+  std::unordered_map<uint64_t, uint64_t>& blob_overlap_scores() {
+    return blob_overlap_scores_;
+  }
+
  private:
   const InternalKeyComparator* internal_comparator_;
   const Comparator* user_comparator_;
@@ -546,8 +553,6 @@ class VersionStorageInfo {
   // ComputeCompactionScore()
   autovector<std::pair<int, FileMetaData*>> files_marked_for_compaction_;
 
-  autovector<std::pair<int, FileMetaData*>> expired_ttl_files_;
-
   // These files are considered bottommost because none of their keys can exist
   // at lower levels. They are not necessarily all in the same level. The marked
   // ones are eligible for compaction because they contain duplicate key
@@ -581,13 +586,16 @@ class VersionStorageInfo {
   enum {
     kHasMapSst = 1ULL << 0,
     kHasRangeDeletion = 1ULL << 1,
+    kMarkedForCompaction = 1ULL << 2,
   };
   std::unordered_map<int, int> space_amplification_;
+  std::unordered_map<uint64_t, uint64_t> blob_overlap_scores_;
   std::vector<double> read_amplification_;
 
   int l0_delay_trigger_count_ = 0;  // Count used to trigger slow down and stop
                                     // for number of L0 files.
 
+  uint64_t blob_file_count_;
   uint64_t blob_file_size_;
   uint64_t blob_num_entries_;
   uint64_t blob_num_deletions_;
@@ -610,6 +618,10 @@ class VersionStorageInfo {
   // If set to true, we will run consistency checks even if RocksDB
   // is compiled in release mode
   bool force_consistency_checks_;
+
+  bool blob_marked_for_compaction_;
+
+  std::unique_ptr<VersionBuilder::Context> version_builder_context_;
 
   friend class Version;
   friend class VersionSet;
@@ -659,7 +671,8 @@ class Version : public SeparateHelper, private LazyBufferState {
            SequenceNumber* seq = nullptr, ReadCallback* callback = nullptr);
 
   void GetKey(const Slice& user_key, const Slice& ikey, Status* status,
-              ValueType* type, SequenceNumber* seq, LazyBuffer* value);
+              ValueType* type, SequenceNumber* seq, LazyBuffer* value,
+              const FileMetaData& blob);
 
   // Loads some stats information from files. Call without mutex held. It needs
   // to be called before applying the version to the version set.
@@ -871,8 +884,11 @@ class VersionSet {
     autovector<VersionEdit*> edit_list;
     edit_list.emplace_back(edit);
     edit_lists.emplace_back(edit_list);
+    autovector<const ColumnFamilyOptions*> column_family_options_list;
+    column_family_options_list.emplace_back(column_family_options);
     return LogAndApply(cfds, mutable_cf_options_list, edit_lists, mu,
-                       db_directory, new_descriptor_log, column_family_options);
+                       db_directory, new_descriptor_log,
+                       column_family_options_list);
   }
   // The batch version. If edit_list.size() > 1, caller must ensure that
   // no edit in the list column family add or drop
@@ -888,8 +904,11 @@ class VersionSet {
     mutable_cf_options_list.emplace_back(&mutable_cf_options);
     autovector<autovector<VersionEdit*>> edit_lists;
     edit_lists.emplace_back(edit_list);
+    autovector<const ColumnFamilyOptions*> column_family_options_list;
+    column_family_options_list.emplace_back(column_family_options);
     return LogAndApply(cfds, mutable_cf_options_list, edit_lists, mu,
-                       db_directory, new_descriptor_log, column_family_options);
+                       db_directory, new_descriptor_log,
+                       column_family_options_list);
   }
 
   // The across-multi-cf batch version. If edit_lists contain more than
@@ -901,7 +920,7 @@ class VersionSet {
       const autovector<autovector<VersionEdit*>>& edit_lists,
       InstrumentedMutex* mu, Directory* db_directory = nullptr,
       bool new_descriptor_log = false,
-      const ColumnFamilyOptions* new_cf_options = nullptr);
+      const autovector<const ColumnFamilyOptions*>& new_cf_options_list = {});
 
   // Recover the last saved descriptor from persistent storage.
   // If read_only == true, Recover() will not complain if some column families
@@ -1128,8 +1147,7 @@ class VersionSet {
 
   Status ProcessManifestWrites(std::deque<ManifestWriter>& writers,
                                InstrumentedMutex* mu, Directory* db_directory,
-                               bool new_descriptor_log,
-                               const ColumnFamilyOptions* new_cf_options);
+                               bool new_descriptor_log);
 
   std::unique_ptr<ColumnFamilySet> column_family_set_;
 

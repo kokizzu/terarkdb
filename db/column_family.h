@@ -26,6 +26,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
 #include "rocksdb/terark_namespace.h"
+#include "util/chash_set.h"
 #include "util/thread_local.h"
 
 namespace TERARKDB_NAMESPACE {
@@ -196,6 +197,10 @@ class ColumnFamilyData {
   void SetDropped();
   bool IsDropped() const { return dropped_.load(std::memory_order_relaxed); }
 
+  bool OptimizeFiltersForHits() const {
+    return optimize_filters_for_hits_.load(std::memory_order_relaxed);
+  }
+
   // thread-safe
   int NumberLevels() const { return ioptions_.num_levels; }
 
@@ -231,6 +236,7 @@ class ColumnFamilyData {
 #ifndef ROCKSDB_LITE
   // REQUIRES: DB mutex held
   Status SetOptions(
+      const ImmutableDBOptions& db_options,
       const std::unordered_map<std::string, std::string>& options_map);
 #endif  // ROCKSDB_LITE
 
@@ -297,17 +303,18 @@ class ColumnFamilyData {
   static const int kCompactToBaseLevel;
 
   // REQUIRES: DB mutex held
-  void PrepareManualCompaction(
-      const MutableCFOptions& mutable_cf_options, const Slice* begin,
-      const Slice* end, std::unordered_set<uint64_t>* files_being_compact);
+  void PrepareManualCompaction(const MutableCFOptions& mutable_cf_options,
+                               const Slice* begin, const Slice* end,
+                               chash_set<uint64_t>* files_being_compact);
 
   // REQUIRES: DB mutex held
-  Compaction* CompactRange(
-      const MutableCFOptions& mutable_cf_options, int input_level,
-      int output_level, uint32_t output_path_id, uint32_t max_subcompactions,
-      const InternalKey* begin, const InternalKey* end,
-      InternalKey** compaction_end, bool* manual_conflict,
-      const std::unordered_set<uint64_t>* files_being_compact);
+  Compaction* CompactRange(const MutableCFOptions& mutable_cf_options,
+                           SeparationType separation_type, int input_level,
+                           int output_level, uint32_t output_path_id,
+                           uint32_t max_subcompactions,
+                           const InternalKey* begin, const InternalKey* end,
+                           InternalKey** compaction_end, bool* manual_conflict,
+                           const chash_set<uint64_t>* files_being_compact);
 
   CompactionPicker* compaction_picker() { return compaction_picker_.get(); }
   // thread-safe
@@ -429,7 +436,8 @@ class ColumnFamilyData {
 
   std::atomic<int> refs_;  // outstanding references to ColumnFamilyData
   std::atomic<bool> initialized_;
-  std::atomic<bool> dropped_;  // true if client dropped it
+  std::atomic<bool> dropped_;                    // true if client dropped it
+  std::atomic<bool> optimize_filters_for_hits_;  // for read output mutex
 
   const InternalKeyComparator internal_comparator_;
   const ColumnFamilyOptions initial_cf_options_;

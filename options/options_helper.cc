@@ -170,6 +170,14 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
   cf_opts.blob_size = mutable_cf_options.blob_size;
   cf_opts.blob_large_key_ratio = mutable_cf_options.blob_large_key_ratio;
   cf_opts.blob_gc_ratio = mutable_cf_options.blob_gc_ratio;
+  cf_opts.target_blob_file_size = mutable_cf_options.target_blob_file_size;
+  cf_opts.blob_file_defragment_size =
+      mutable_cf_options.blob_file_defragment_size;
+  cf_opts.max_dependence_blob_overlap =
+      mutable_cf_options.max_dependence_blob_overlap;
+  cf_opts.optimize_filters_for_hits =
+      mutable_cf_options.optimize_filters_for_hits;
+  cf_opts.optimize_range_deletion = mutable_cf_options.optimize_range_deletion;
   cf_opts.soft_pending_compaction_bytes_limit =
       mutable_cf_options.soft_pending_compaction_bytes_limit;
   cf_opts.hard_pending_compaction_bytes_limit =
@@ -188,17 +196,12 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
       mutable_cf_options.max_bytes_for_level_base;
   cf_opts.max_bytes_for_level_multiplier =
       mutable_cf_options.max_bytes_for_level_multiplier;
-  cf_opts.ttl = mutable_cf_options.ttl;
   cf_opts.ttl_gc_ratio = mutable_cf_options.ttl_gc_ratio;
   cf_opts.ttl_max_scan_gap = mutable_cf_options.ttl_max_scan_gap;
 
-  cf_opts.max_bytes_for_level_multiplier_additional.clear();
-  for (auto value :
-       mutable_cf_options.max_bytes_for_level_multiplier_additional) {
-    cf_opts.max_bytes_for_level_multiplier_additional.emplace_back(value);
-  }
+  cf_opts.max_bytes_for_level_multiplier_additional =
+      mutable_cf_options.max_bytes_for_level_multiplier_additional;
 
-  cf_opts.compaction_options_fifo = mutable_cf_options.compaction_options_fifo;
   cf_opts.compaction_options_universal =
       mutable_cf_options.compaction_options_universal;
 
@@ -221,7 +224,6 @@ std::map<CompactionStyle, std::string>
     OptionsHelper::compaction_style_to_string = {
         {kCompactionStyleLevel, "kCompactionStyleLevel"},
         {kCompactionStyleUniversal, "kCompactionStyleUniversal"},
-        {kCompactionStyleFIFO, "kCompactionStyleFIFO"},
         {kCompactionStyleNone, "kCompactionStyleNone"}};
 
 std::map<CompactionPri, std::string> OptionsHelper::compaction_pri_to_string = {
@@ -336,21 +338,6 @@ bool ParseVectorCompressionType(
       start = end + 1;
     }
   }
-  return true;
-}
-
-// This is to handle backward compatibility, where compaction_options_fifo
-// could be assigned a single scalar value, say, like "23", which would be
-// assigned to max_table_files_size.
-bool FIFOCompactionOptionsSpecialCase(const std::string& opt_str,
-                                      CompactionOptionsFIFO* options) {
-  if (opt_str.find("=") != std::string::npos) {
-    // New format. Go do your new parsing using ParseStructOptions.
-    return false;
-  }
-
-  // Old format. Parse just a single uint64_t value.
-  options->max_table_files_size = ParseUint64(opt_str);
   return true;
 }
 
@@ -571,15 +558,6 @@ bool ParseOptionHelper(char* opt_address, const OptionType& opt_type,
       return ParseEnum<InfoLogLevel>(
           info_log_level_string_map, value,
           reinterpret_cast<InfoLogLevel*>(opt_address));
-    case OptionType::kCompactionOptionsFIFO: {
-      if (!FIFOCompactionOptionsSpecialCase(
-              value, reinterpret_cast<CompactionOptionsFIFO*>(opt_address))) {
-        return ParseStructOptions<CompactionOptionsFIFO>(
-            value, reinterpret_cast<CompactionOptionsFIFO*>(opt_address),
-            fifo_compaction_options_type_info);
-      }
-      return true;
-    }
     case OptionType::kLRUCacheOptions: {
       return ParseStructOptions<LRUCacheOptions>(
           value, reinterpret_cast<LRUCacheOptions*>(opt_address),
@@ -775,10 +753,6 @@ bool SerializeSingleOptionHelper(const char* opt_address,
       return SerializeEnum<InfoLogLevel>(
           info_log_level_string_map,
           *reinterpret_cast<const InfoLogLevel*>(opt_address), value);
-    case OptionType::kCompactionOptionsFIFO:
-      return SerializeStruct<CompactionOptionsFIFO>(
-          *reinterpret_cast<const CompactionOptionsFIFO*>(opt_address), value,
-          fifo_compaction_options_type_info);
     case OptionType::kCompactionOptionsUniversal:
       return SerializeStruct<CompactionOptionsUniversal>(
           *reinterpret_cast<const CompactionOptionsUniversal*>(opt_address),
@@ -1833,7 +1807,6 @@ std::unordered_map<std::string, CompactionStyle>
     OptionsHelper::compaction_style_string_map = {
         {"kCompactionStyleLevel", kCompactionStyleLevel},
         {"kCompactionStyleUniversal", kCompactionStyleUniversal},
-        {"kCompactionStyleFIFO", kCompactionStyleFIFO},
         {"kCompactionStyleNone", kCompactionStyleNone}};
 
 std::unordered_map<std::string, CompactionPri>
@@ -1952,6 +1925,18 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::blob_gc_ratio), OptionType::kDouble,
           OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, blob_gc_ratio)}},
+        {"target_blob_file_size",
+         {offset_of(&ColumnFamilyOptions::target_blob_file_size),
+          OptionType::kUInt64T, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, target_blob_file_size)}},
+        {"blob_file_defragment_size",
+         {offset_of(&ColumnFamilyOptions::blob_file_defragment_size),
+          OptionType::kUInt64T, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, blob_file_defragment_size)}},
+        {"max_dependence_blob_overlap",
+         {offset_of(&ColumnFamilyOptions::max_dependence_blob_overlap),
+          OptionType::kSizeT, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, max_dependence_blob_overlap)}},
         {"filter_deletes",
          {0, OptionType::kBoolean, OptionVerificationType::kDeprecated, true,
           0}},
@@ -1969,7 +1954,12 @@ std::unordered_map<std::string, OptionTypeInfo>
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
         {"optimize_filters_for_hits",
          {offset_of(&ColumnFamilyOptions::optimize_filters_for_hits),
-          OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, optimize_filters_for_hits)}},
+        {"optimize_range_deletion",
+         {offset_of(&ColumnFamilyOptions::optimize_range_deletion),
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, optimize_range_deletion)}},
         {"paranoid_file_checks",
          {offset_of(&ColumnFamilyOptions::paranoid_file_checks),
           OptionType::kBoolean, OptionVerificationType::kNormal, true,
@@ -2160,19 +2150,11 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::compaction_pri),
           OptionType::kCompactionPri, OptionVerificationType::kNormal, false,
           0}},
-        {"compaction_options_fifo",
-         {offset_of(&ColumnFamilyOptions::compaction_options_fifo),
-          OptionType::kCompactionOptionsFIFO, OptionVerificationType::kNormal,
-          true, offsetof(struct MutableCFOptions, compaction_options_fifo)}},
         {"compaction_options_universal",
          {offset_of(&ColumnFamilyOptions::compaction_options_universal),
           OptionType::kCompactionOptionsUniversal,
           OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, compaction_options_universal)}},
-        {"ttl",
-         {offset_of(&ColumnFamilyOptions::ttl), OptionType::kUInt64T,
-          OptionVerificationType::kNormal, true,
-          offsetof(struct MutableCFOptions, ttl)}},
         {"ttl_gc_ratio",
          {offset_of(&ColumnFamilyOptions::ttl_gc_ratio), OptionType::kDouble,
           OptionVerificationType::kNormal, true,
@@ -2181,21 +2163,6 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::ttl_max_scan_gap), OptionType::kSizeT,
           OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, ttl_max_scan_gap)}}};
-
-std::unordered_map<std::string, OptionTypeInfo>
-    OptionsHelper::fifo_compaction_options_type_info = {
-        {"max_table_files_size",
-         {offset_of(&CompactionOptionsFIFO::max_table_files_size),
-          OptionType::kUInt64T, OptionVerificationType::kNormal, true,
-          offsetof(struct CompactionOptionsFIFO, max_table_files_size)}},
-        {"ttl",
-         {offset_of(&CompactionOptionsFIFO::ttl), OptionType::kUInt64T,
-          OptionVerificationType::kNormal, true,
-          offsetof(struct CompactionOptionsFIFO, ttl)}},
-        {"allow_compaction",
-         {offset_of(&CompactionOptionsFIFO::allow_compaction),
-          OptionType::kBoolean, OptionVerificationType::kNormal, true,
-          offsetof(struct CompactionOptionsFIFO, allow_compaction)}}};
 
 std::unordered_map<std::string, OptionTypeInfo>
     OptionsHelper::universal_compaction_options_type_info = {

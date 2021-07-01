@@ -115,8 +115,6 @@ struct ImmutableCFOptions {
 
   int num_levels;
 
-  bool optimize_filters_for_hits;
-
   bool force_consistency_checks;
 
   bool allow_ingest_behind;
@@ -159,6 +157,9 @@ struct MutableCFOptions {
         blob_size(0),
         blob_large_key_ratio(0),
         blob_gc_ratio(0),
+        target_blob_file_size(0),
+        blob_file_defragment_size(0),
+        max_dependence_blob_overlap(0),
         soft_pending_compaction_bytes_limit(0),
         hard_pending_compaction_bytes_limit(0),
         level0_file_num_compaction_trigger(0),
@@ -169,11 +170,11 @@ struct MutableCFOptions {
         target_file_size_multiplier(0),
         max_bytes_for_level_base(0),
         max_bytes_for_level_multiplier(0),
-        ttl(0),
-        compaction_options_fifo(),
         max_sequential_skip_in_iterations(0),
         paranoid_file_checks(false),
         report_bg_io_stats(false),
+        optimize_filters_for_hits(false),
+        optimize_range_deletion(false),
         compression(Snappy_Supported() ? kSnappyCompression : kNoCompression),
         ttl_gc_ratio(1.000),
         ttl_max_scan_gap(0) {}
@@ -187,9 +188,7 @@ struct MutableCFOptions {
   // Must be called after any change to MutableCFOptions
   void RefreshDerivedOptions(int num_levels);
 
-  void RefreshDerivedOptions(const ImmutableCFOptions& ioptions) {
-    RefreshDerivedOptions(ioptions.num_levels);
-  }
+  void RefreshDerivedOptions(const ImmutableCFOptions& ioptions);
 
   int MaxBytesMultiplerAdditional(int level) const {
     if (level >=
@@ -218,6 +217,9 @@ struct MutableCFOptions {
   size_t blob_size;
   double blob_large_key_ratio;
   double blob_gc_ratio;
+  uint64_t target_blob_file_size;
+  uint64_t blob_file_defragment_size;
+  size_t max_dependence_blob_overlap;
   uint64_t soft_pending_compaction_bytes_limit;
   uint64_t hard_pending_compaction_bytes_limit;
   int level0_file_num_compaction_trigger;
@@ -228,15 +230,16 @@ struct MutableCFOptions {
   int target_file_size_multiplier;
   uint64_t max_bytes_for_level_base;
   double max_bytes_for_level_multiplier;
-  uint64_t ttl;
   std::vector<int> max_bytes_for_level_multiplier_additional;
-  CompactionOptionsFIFO compaction_options_fifo;
   CompactionOptionsUniversal compaction_options_universal;
 
   // Misc options
   uint64_t max_sequential_skip_in_iterations;
   bool paranoid_file_checks;
   bool report_bg_io_stats;
+
+  bool optimize_filters_for_hits;
+  bool optimize_range_deletion;
   CompressionType compression;
 
   // Derived options
@@ -257,4 +260,8 @@ uint64_t MaxFileSizeForLevel(const MutableCFOptions& cf_options, int level,
                              CompactionStyle compaction_style,
                              int base_level = 1,
                              bool level_compaction_dynamic_level_bytes = false);
+
+uint64_t MaxBlobSize(const MutableCFOptions& cf_options, int num_levels,
+                     CompactionStyle compaction_style);
+
 }  // namespace TERARKDB_NAMESPACE

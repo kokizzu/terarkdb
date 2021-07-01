@@ -238,6 +238,7 @@ TEST_F(DBSSTTest, DeleteObsoleteFilesPendingOutputs) {
   listener->SetExpectedFileName(dbname_ + file_on_L2);
 
   ASSERT_OK(dbfull()->TEST_CompactRange(3, nullptr, nullptr, nullptr,
+                                        kCompactionTransToSeparate,
                                         true /* disallow trivial move */));
   ASSERT_EQ("0,0,0,0,1", FilesPerLevel(0));
 
@@ -338,9 +339,11 @@ TEST_F(DBSSTTest, RateLimitedDelete) {
       "InstrumentedCondVar::TimedWaitInternal", [&](void* arg) {
         // Turn timed wait into a simulated sleep
         uint64_t* abs_time_us = static_cast<uint64_t*>(arg);
-        uint64_t cur_time = env_->NowMicros();
-        if (*abs_time_us > cur_time) {
-          env_->addon_time_.fetch_add(*abs_time_us - cur_time);
+        int64_t cur_time = 0;
+        env_->GetCurrentTime(&cur_time);
+        if (*abs_time_us > static_cast<uint64_t>(cur_time)) {
+          env_->addon_time_.fetch_add(*abs_time_us -
+                                      static_cast<uint64_t>(cur_time));
         }
 
         // Randomly sleep shortly
@@ -348,8 +351,9 @@ TEST_F(DBSSTTest, RateLimitedDelete) {
             static_cast<uint64_t>(Random::GetTLSInstance()->Uniform(10)));
 
         // Set wait until time to before current to force not to sleep.
-        uint64_t real_cur_time = env_->NowMicros();
-        *abs_time_us = real_cur_time;
+        int64_t real_cur_time = 0;
+        Env::Default()->GetCurrentTime(&real_cur_time);
+        *abs_time_us = static_cast<uint64_t>(real_cur_time);
       });
 
   TERARKDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
@@ -412,7 +416,8 @@ TEST_F(DBSSTTest, RateLimitedDelete) {
   ASSERT_EQ(penalties.size(), metadata.size());
   for (size_t i = 0; i < metadata.size(); i++) {
     total_files_size += metadata[i].size;
-    expected_penlty = ((total_files_size * 1000000) / rate_bytes_per_sec);
+    expected_penlty =
+        ((total_files_size * kMicrosInSecond) / rate_bytes_per_sec);
     ASSERT_EQ(expected_penlty, penalties[i]);
   }
   ASSERT_GT(time_spent_deleting, expected_penlty * 0.9);

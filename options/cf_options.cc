@@ -76,7 +76,6 @@ ImmutableCFOptions::ImmutableCFOptions(const ImmutableDBOptions& db_options,
       new_table_reader_for_compaction_inputs(
           db_options.new_table_reader_for_compaction_inputs),
       num_levels(cf_options.num_levels),
-      optimize_filters_for_hits(cf_options.optimize_filters_for_hits),
       force_consistency_checks(cf_options.force_consistency_checks),
       allow_ingest_behind(db_options.allow_ingest_behind),
       preserve_deletes(db_options.preserve_deletes),
@@ -127,6 +126,16 @@ uint64_t MaxFileSizeForLevel(const MutableCFOptions& cf_options, int level,
   }
 }
 
+uint64_t MaxBlobSize(const MutableCFOptions& cf_options, int num_levels,
+                     CompactionStyle compaction_style) {
+  size_t target_blob_file_size = cf_options.target_blob_file_size;
+  if (target_blob_file_size == 0) {
+    target_blob_file_size =
+        MaxFileSizeForLevel(cf_options, num_levels - 1, compaction_style);
+  }
+  return target_blob_file_size;
+}
+
 void MutableCFOptions::RefreshDerivedOptions(int num_levels) {
   max_file_size.resize(num_levels);
   max_file_size[0] = 0;  // unlimited
@@ -136,6 +145,24 @@ void MutableCFOptions::RefreshDerivedOptions(int num_levels) {
   for (int i = 2; i < num_levels; ++i) {
     max_file_size[i] = MultiplyCheckOverflow(max_file_size[i - 1],
                                              target_file_size_multiplier);
+  }
+}
+
+void MutableCFOptions::RefreshDerivedOptions(
+    const ImmutableCFOptions& ioptions) {
+  RefreshDerivedOptions(ioptions.num_levels);
+
+  int_tbl_prop_collector_factories = std::make_shared<
+      std::vector<std::unique_ptr<IntTblPropCollectorFactory>>>();
+  for (auto& f : ioptions.table_properties_collector_factories) {
+    int_tbl_prop_collector_factories->emplace_back(
+        new UserKeyTablePropertiesCollectorFactory(f));
+  }
+  if (ioptions.ttl_extractor_factory != nullptr) {
+    int_tbl_prop_collector_factories->emplace_back(
+        NewTtlIntTblPropCollectorFactory(ioptions.ttl_extractor_factory,
+                                         ioptions.env, ttl_gc_ratio,
+                                         ttl_max_scan_gap));
   }
 }
 
@@ -173,6 +200,12 @@ void MutableCFOptions::Dump(Logger* log) const {
                  blob_large_key_ratio);
   ROCKS_LOG_INFO(log, "                            blob_gc_ratio: %f",
                  blob_gc_ratio);
+  ROCKS_LOG_INFO(log, "                    target_blob_file_size: %" PRIu64,
+                 target_blob_file_size);
+  ROCKS_LOG_INFO(log, "                blob_file_defragment_size: %" PRIu64,
+                 blob_file_defragment_size);
+  ROCKS_LOG_INFO(log, "              max_dependence_blob_overlap: %zu",
+                 max_dependence_blob_overlap);
   ROCKS_LOG_INFO(log, "      soft_pending_compaction_bytes_limit: %" PRIu64,
                  soft_pending_compaction_bytes_limit);
   ROCKS_LOG_INFO(log, "      hard_pending_compaction_bytes_limit: %" PRIu64,
@@ -193,8 +226,6 @@ void MutableCFOptions::Dump(Logger* log) const {
                  max_bytes_for_level_base);
   ROCKS_LOG_INFO(log, "           max_bytes_for_level_multiplier: %f",
                  max_bytes_for_level_multiplier);
-  ROCKS_LOG_INFO(log, "                                      ttl: %" PRIu64,
-                 ttl);
   ROCKS_LOG_INFO(log, "                             ttl_gc_ratio: %f",
                  ttl_gc_ratio);
   ROCKS_LOG_INFO(log, "                         ttl_max_scan_gap: %zd",
@@ -219,6 +250,10 @@ void MutableCFOptions::Dump(Logger* log) const {
                  paranoid_file_checks);
   ROCKS_LOG_INFO(log, "                       report_bg_io_stats: %d",
                  report_bg_io_stats);
+  ROCKS_LOG_INFO(log, "                optimize_filters_for_hits: %d",
+                 optimize_filters_for_hits);
+  ROCKS_LOG_INFO(log, "                  optimize_range_deletion: %d",
+                 optimize_range_deletion);
   ROCKS_LOG_INFO(log, "                              compression: %d",
                  static_cast<int>(compression));
 
@@ -240,14 +275,6 @@ void MutableCFOptions::Dump(Logger* log) const {
   ROCKS_LOG_INFO(
       log, "compaction_options_universal.allow_trivial_move : %d",
       static_cast<int>(compaction_options_universal.allow_trivial_move));
-
-  // FIFO Compaction Options
-  ROCKS_LOG_INFO(log, "compaction_options_fifo.max_table_files_size : %" PRIu64,
-                 compaction_options_fifo.max_table_files_size);
-  ROCKS_LOG_INFO(log, "compaction_options_fifo.ttl : %" PRIu64,
-                 compaction_options_fifo.ttl);
-  ROCKS_LOG_INFO(log, "compaction_options_fifo.allow_compaction : %d",
-                 compaction_options_fifo.allow_compaction);
 }
 
 MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
@@ -266,6 +293,9 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       blob_size(options.blob_size),
       blob_large_key_ratio(options.blob_large_key_ratio),
       blob_gc_ratio(options.blob_gc_ratio),
+      target_blob_file_size(options.target_blob_file_size),
+      blob_file_defragment_size(options.blob_file_defragment_size),
+      max_dependence_blob_overlap(options.max_dependence_blob_overlap),
       soft_pending_compaction_bytes_limit(
           options.soft_pending_compaction_bytes_limit),
       hard_pending_compaction_bytes_limit(
@@ -279,15 +309,15 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       target_file_size_multiplier(options.target_file_size_multiplier),
       max_bytes_for_level_base(options.max_bytes_for_level_base),
       max_bytes_for_level_multiplier(options.max_bytes_for_level_multiplier),
-      ttl(options.ttl),
       max_bytes_for_level_multiplier_additional(
           options.max_bytes_for_level_multiplier_additional),
-      compaction_options_fifo(options.compaction_options_fifo),
       compaction_options_universal(options.compaction_options_universal),
       max_sequential_skip_in_iterations(
           options.max_sequential_skip_in_iterations),
       paranoid_file_checks(options.paranoid_file_checks),
       report_bg_io_stats(options.report_bg_io_stats),
+      optimize_filters_for_hits(options.optimize_filters_for_hits),
+      optimize_range_deletion(options.optimize_range_deletion),
       compression(options.compression),
       ttl_gc_ratio(options.ttl_gc_ratio),
       ttl_max_scan_gap(options.ttl_max_scan_gap) {

@@ -50,6 +50,7 @@
 #include "db/merge_context.h"
 #include "db/merge_helper.h"
 #include "db/range_del_aggregator.h"
+#include "db/version_edit.h"
 #include "db/version_set.h"
 #include "monitoring/iostats_context_imp.h"
 #include "monitoring/thread_status_util.h"
@@ -68,10 +69,12 @@
 #include "table/table_builder.h"
 #include "util/async_task.h"
 #include "util/c_style_callback.h"
+#include "util/chash_set.h"
 #include "util/coding.h"
 #include "util/file_reader_writer.h"
 #include "util/file_util.h"
 #include "util/filename.h"
+#include "util/heap.h"
 #include "util/log_buffer.h"
 #include "util/logging.h"
 #include "util/random.h"
@@ -109,8 +112,6 @@ const char* GetCompactionReasonString(CompactionReason compaction_reason) {
       return "FilesMarkedForCompaction";
     case CompactionReason::kBottommostFiles:
       return "BottommostFiles";
-    case CompactionReason::kTtl:
-      return "Ttl";
     case CompactionReason::kFlush:
       return "Flush";
     case CompactionReason::kExternalSstIngestion:
@@ -257,7 +258,7 @@ struct CompactionJob::SubcompactionState {
 
   SubcompactionState& operator=(const SubcompactionState&) = delete;
 
-  // Returns true iff we should stop building the current output
+  // Returns true if we should stop building the current output
   // before processing "internal_key".
   bool ShouldStopBefore(const Slice& internal_key, uint64_t curr_file_size) {
     const InternalKeyComparator* icmp =
@@ -282,11 +283,307 @@ struct CompactionJob::SubcompactionState {
     if (overlapped_bytes + curr_file_size >
         compaction->max_compaction_bytes()) {
       // Too much overlap for current output; start new output
-      overlapped_bytes = 0;
       return true;
     }
 
     return false;
+  }
+
+  struct RebuildBlobsInfo {
+    chash_set<uint64_t> blobs;
+    uint64_t pop_count;
+  };
+  struct BlobRefInfo {
+    uint64_t file_number;
+    FileMetaData* meta;
+    uint64_t ref_bytes;
+    operator uint64_t() const { return file_number; }
+  };
+
+  struct InputBlobInfo {
+    std::vector<BlobRefInfo> blobs;
+    uint64_t input_bytes;
+  };
+  Status GetRebuildNeededBlobs(const CompactionJob* job,
+                               RebuildBlobsInfo* output) {
+    assert(output != nullptr);
+    chash_set<uint64_t>& rebuild_blob_set = output->blobs;
+    output->pop_count = 0;
+
+    auto mutable_cf_options = compaction->mutable_cf_options();
+    auto& score_map = compaction->current_blob_overlap_scores();
+    auto ucmp = compaction->immutable_cf_options()->user_comparator;
+    size_t target_overlap = mutable_cf_options->max_dependence_blob_overlap;
+    uint64_t max_compaction_bytes =
+        compaction->mutable_cf_options()->max_compaction_bytes;
+
+    auto user_cmp = [ucmp](const InternalKey& k1, const InternalKey& k2) {
+      return ucmp->Compare(k1.user_key(), k2.user_key());
+    };
+
+    // get all blob of inputs, and sort it
+    InputBlobInfo input_blob_info;
+    auto s = GetSortedInputBlobs(job, &input_blob_info);
+    auto& blobs = input_blob_info.blobs;
+    if (!s.ok() || blobs.empty()) {
+      return s;
+    }
+    if (job->separation_type() == kCompactionForceRebuildBlob) {
+      // when need_rebuild_blobs.empty() == true, means rebuild all blobs
+      for (auto& info : blobs) {
+        rebuild_blob_set.insert(info.file_number);
+      }
+      return s;
+    }
+
+    // get all blobs in target overlaped ranges, store those files in a min-heap
+    // based on its overlap score, and summary all blobs compaction bytes
+    auto blob_end_cmp = [user_cmp](BlobRefInfo* b1, BlobRefInfo* b2) {
+      return user_cmp(b1->meta->largest, b2->meta->largest) > 0;
+    };
+    auto end_queue = make_heap<BlobRefInfo*>(blob_end_cmp);
+
+    struct TargetRangeBlobItem {
+      uint64_t file_number;
+      uint64_t ref_bytes;
+      double score;
+    };
+    auto blob_overlapscore_cmp = [score_map](const TargetRangeBlobItem& b1,
+                                             const TargetRangeBlobItem& b2) {
+      return b1.score > b2.score;
+    };
+    auto target_range_blob_heap =
+        make_heap<TargetRangeBlobItem>(blob_overlapscore_cmp);
+
+    uint64_t total_compaction_bytes = input_blob_info.input_bytes;
+    if (compaction->partial_compaction() &&
+        compaction->max_output_file_size() != 0) {
+      total_compaction_bytes =
+          std::min(total_compaction_bytes, compaction->max_output_file_size());
+    }
+
+    auto start = blobs[0].meta->smallest;
+    end_queue.push(&blobs[0]);
+    std::vector<InternalKey> prev_range;
+    for (size_t i = 0; i < blobs.size() && !end_queue.empty();) {
+      bool valid_range =
+          prev_range.empty() ||
+          !(user_cmp(prev_range[0], start) <= 0 &&
+            user_cmp(prev_range[1], end_queue.top()->meta->largest) >= 0);
+      bool find_target_range =
+          end_queue.size() >= target_overlap && valid_range;
+      if (find_target_range) {
+        if (prev_range.empty()) {
+          prev_range.push_back(start);
+          prev_range.push_back(end_queue.top()->meta->largest);
+        } else {
+          prev_range[0] = start;
+          prev_range[1] = end_queue.top()->meta->largest;
+        }
+
+        // collect blobs
+        for (auto& b : end_queue.data()) {
+          auto ib = rebuild_blob_set.emplace(b->file_number);
+          if (ib.second) {
+            total_compaction_bytes += b->ref_bytes;
+            auto find = score_map.find(b->file_number);
+            assert(find != score_map.end());
+            double global_score = 1;
+            if (find != score_map.end()) {
+              global_score = find->second;
+            }
+            target_range_blob_heap.push(TargetRangeBlobItem{
+                b->file_number, b->ref_bytes, global_score / b->ref_bytes});
+          }
+        }
+      }
+
+      if (i + 1 < blobs.size() &&
+          (user_cmp(blobs[i + 1].meta->smallest,
+                    end_queue.top()->meta->largest) < 0 ||
+           end_queue.size() == 1)) {
+        if (user_cmp(blobs[i + 1].meta->smallest,
+                     end_queue.top()->meta->largest) >= 0) {
+          end_queue.pop();
+        }
+        i++;
+        start = blobs[i].meta->smallest;
+        end_queue.push(&blobs[i]);
+      } else {
+        start = end_queue.top()->meta->largest;
+        end_queue.pop();
+      }
+    }
+    // pop smaller scores if total_compaction_bytes > max_compaction_bytes
+    // remain one blob al least.
+
+    size_t target_blob_file_size = MaxBlobSize(
+        *mutable_cf_options, compaction->immutable_cf_options()->num_levels,
+        compaction->immutable_cf_options()->compaction_style);
+
+    uint64_t target_compaction_bytes =
+        std::max(max_compaction_bytes,
+                 input_blob_info.input_bytes + target_blob_file_size);
+    while (total_compaction_bytes > target_compaction_bytes &&
+           target_range_blob_heap.size() > 1) {
+      total_compaction_bytes -= target_range_blob_heap.top().ref_bytes;
+      rebuild_blob_set.erase(target_range_blob_heap.top().file_number);
+      target_range_blob_heap.pop();
+      ++output->pop_count;
+    }
+    TEST_SYNC_POINT_CALLBACK("Compaction::GetRebuildNeededBlobs::End",
+                             &rebuild_blob_set);
+    return Status::OK();
+  }
+
+ private:
+  Status GetSortedInputBlobs(const CompactionJob* job, InputBlobInfo* output) {
+    assert(output != nullptr);
+    output->blobs.clear();
+    output->input_bytes = 0;
+
+    auto ucmp = compaction->immutable_cf_options()->user_comparator;
+    auto& icmp = compaction->immutable_cf_options()->internal_comparator;
+
+    // get sst in input range
+    chash_set<uint64_t> input_sst;
+    auto& dependence_map =
+        compaction->input_version()->storage_info()->dependence_map();
+    auto table_cache = compaction->column_family_data()->table_cache();
+    auto create_iter = [&](const FileMetaData* file_metadata,
+                           const DependenceMap& depend_map, Arena* arena,
+                           TableReader** table_reader_ptr) {
+      return table_cache->NewIterator(
+          ReadOptions(), job->env_options_, icmp, *file_metadata, depend_map,
+          nullptr, compaction->mutable_cf_options()->prefix_extractor.get(),
+          table_reader_ptr, nullptr, false, arena, true, -1);
+    };
+    InternalKey internal_begin, internal_end;
+    if (start != nullptr) {
+      internal_begin.SetMinPossibleForUserKey(*start);
+    }
+    if (end != nullptr) {
+      internal_end.SetMaxPossibleForUserKey(*end);
+    }
+    MapSstElement element;
+    for (auto& level_files : *compaction->inputs()) {
+      if (level_files.empty()) {
+        continue;
+      }
+      Arena arena;
+      ScopedArenaIterator iter(NewMapElementIterator(
+          level_files.files.data(), level_files.files.size(), &icmp,
+          &create_iter, c_style_callback(create_iter), &arena));
+      for (level_files.level == 0 || start == nullptr
+               ? iter->SeekToFirst()
+               : iter->Seek(internal_begin.Encode());
+           iter->Valid(); iter->Next()) {
+        LazyBuffer value = iter->value();
+        if (!value.fetch().ok() ||
+            !element.Decode(iter->key(), value.slice())) {
+          // TODO log error
+          break;
+        }
+        if (level_files.level == 0 && start != nullptr &&
+            icmp.Compare(element.largest_key, internal_begin.Encode()) < 0) {
+          continue;
+        }
+        if (end != nullptr &&
+            ucmp->Compare(ExtractUserKey(element.smallest_key), *end) > 0) {
+          if (level_files.level == 0) {
+            continue;
+          } else {
+            break;
+          }
+        }
+
+        for (auto& link : element.link) {
+          input_sst.emplace(link.file_number);
+        }
+      }
+    }
+    InternalKey smallest, largest;
+    auto get_offset = [&](FileMetaData* meta, const InternalKey& ik,
+                          uint64_t* offset_ptr) {
+      TableReader* table_reader_ptr = meta->fd.table_reader;
+      if (icmp.Compare(ik, meta->smallest) <= 0) {
+        *offset_ptr = 0;
+      } else if (icmp.Compare(meta->largest, ik) <= 0) {
+        *offset_ptr = meta->fd.GetFileSize();
+      } else if (table_reader_ptr != nullptr) {
+        *offset_ptr = table_reader_ptr->ApproximateOffsetOf(ik.Encode());
+      } else {
+        TableCache* table_cache =
+            compaction->column_family_data()->table_cache();
+        Cache::Handle* handle = nullptr;
+        auto s = table_cache->FindTable(
+            job->env_options_, icmp, meta->fd, &handle,
+            compaction->mutable_cf_options()->prefix_extractor.get());
+        if (!s.ok()) {
+          return s;
+        }
+        table_reader_ptr = table_cache->GetTableReaderFromHandle(handle);
+        *offset_ptr = table_reader_ptr->ApproximateOffsetOf(ik.Encode());
+        table_cache->ReleaseHandle(handle);
+      }
+      return Status::OK();
+    };
+    chash_map<uint64_t, std::pair<FileMetaData*, uint64_t>> blob_map;
+    // collect and sort blob_map of sst
+    for (auto& fn : input_sst) {
+      auto find = dependence_map.find(fn);
+      if (find == dependence_map.end()) {
+        // TODO ???
+        continue;
+      }
+      auto file = find->second;
+      uint64_t start_offset = 0, end_offset = file->fd.GetFileSize();
+      if (start != nullptr) {
+        auto s = get_offset(file, internal_begin, &start_offset);
+        if (!s.ok()) {
+          return s;
+        }
+      }
+      if (end != nullptr) {
+        auto s = get_offset(file, internal_end, &end_offset);
+        if (!s.ok()) {
+          return s;
+        }
+      }
+      assert(start_offset <= end_offset);
+      output->input_bytes += std::max(start_offset, end_offset) - start_offset;
+      for (auto& pair : file->prop.dependence) {
+        find = dependence_map.find(pair.file_number);
+        if (find == dependence_map.end() || find->second->is_gc_forbidden()) {
+          continue;
+        }
+        auto ib =
+            blob_map.emplace(find->second->fd.GetNumber(),
+                             std::make_pair(find->second, pair.entry_count));
+        if (!ib.second) {
+          ib.first->second.second += pair.entry_count;
+        }
+      }
+    }
+    output->blobs.reserve(blob_map.size());
+    for (auto& pair : blob_map) {
+      auto meta = pair.second.first;
+      uint64_t total_bytes = meta->fd.GetFileSize();
+      uint64_t ref_bytes =
+          total_bytes * pair.second.second / meta->prop.num_entries;
+      output->blobs.emplace_back(BlobRefInfo{pair.first, meta, ref_bytes});
+    }
+    std::sort(output->blobs.begin(), output->blobs.end(),
+              [&](const BlobRefInfo& b1, const BlobRefInfo& b2) {
+                int c = ucmp->Compare(b1.meta->smallest.user_key(),
+                                      b2.meta->smallest.user_key());
+                if (c == 0) {
+                  c = ucmp->Compare(b1.meta->largest.user_key(),
+                                    b2.meta->largest.user_key());
+                }
+                return c < 0;
+              });
+    return Status::OK();
   }
 };
 
@@ -342,6 +639,10 @@ struct CompactionJob::CompactionState {
     return Slice(nullptr, 0);
   }
 };
+
+SeparationType CompactionJob::separation_type() const {
+  return compact_->compaction->separation_type();
+}
 
 void CompactionJob::AggregateStatistics() {
   for (SubcompactionState& sc : compact_->sub_compact_states) {
@@ -428,9 +729,7 @@ void CompactionJob::ReportStartedCompaction(Compaction* compaction) {
          compaction->is_manual_compaction() == true);
 
   ThreadStatusUtil::SetThreadOperationProperty(
-      ThreadStatus::COMPACTION_PROP_FLAGS,
-      compaction->is_manual_compaction() +
-          (compaction->deletion_compaction() << 1));
+      ThreadStatus::COMPACTION_PROP_FLAGS, compaction->is_manual_compaction());
 
   ThreadStatusUtil::SetThreadOperationProperty(
       ThreadStatus::COMPACTION_TOTAL_INPUT_BYTES,
@@ -742,6 +1041,7 @@ Status CompactionJob::Run() {
     context.compaction_filter_factory = factory->Name();
   }
   context.blob_config = c->mutable_cf_options()->get_blob_config();
+  context.separation_type = c->separation_type();
   context.table_factory = iopt->table_factory->Name();
   s = iopt->table_factory->GetOptionString(&context.table_factory_options,
                                            "\n");
@@ -784,7 +1084,7 @@ Status CompactionJob::Run() {
   context.output_level = c->output_level();
   context.number_levels = iopt->num_levels;
   context.skip_filters =
-      cfd->ioptions()->optimize_filters_for_hits && bottommost_level_;
+      c->mutable_cf_options()->optimize_filters_for_hits && bottommost_level_;
   context.bottommost_level = c->bottommost_level();
   context.allow_ingest_behind = iopt->allow_ingest_behind;
   context.preserve_deletes = iopt->preserve_deletes;
@@ -880,7 +1180,8 @@ Status CompactionJob::Run() {
           output.meta.prop.max_read_amp = tp->max_read_amp;
           output.meta.prop.read_amp = tp->read_amp;
           output.meta.prop.dependence = tp->dependence;
-          output.meta.prop.inheritance_chain = tp->inheritance_chain;
+          output.meta.prop.inheritance =
+              InheritanceTreeToSet(tp->inheritance_tree);
           if (iopt->ttl_extractor_factory != nullptr) {
             GetCompactionTimePoint(
                 tp->user_collected_properties,
@@ -1251,7 +1552,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
         cfd->ioptions()->level_compaction_dynamic_level_bytes));
     if (kOutFileLen != port::kMaxSizet) {
       const size_t kOutFileNumSamples = kOutFileLen >> kSampleLenShift;
-      Random64 generator{versions_->NewFileNumber()};
+      Random64 generator{Random::GetTLSInstance()->Next()};
       for (size_t i = 0; i < kMaxSamples; ++i) {
         sample_begin_offsets.insert(
             static_cast<size_t>(generator.Uniform(kOutFileNumSamples))
@@ -1311,32 +1612,35 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
             ->value_meta_extractor_factory->CreateValueExtractor(context);
   }
 
+  size_t target_blob_file_size =
+      MaxBlobSize(*mutable_cf_options, cfd->ioptions()->num_levels,
+                  cfd->ioptions()->compaction_style);
+
   auto trans_to_separate = [&](const Slice& key, LazyBuffer& value) {
-    assert(value.file_number() == uint64_t(-1));
-    Status status;
+    Status s;
     TableBuilder* blob_builder = sub_compact->blob_builder.get();
     FileMetaData* blob_meta = &sub_compact->current_blob_output()->meta;
     if (blob_builder != nullptr &&
-        blob_builder->FileSize() > mutable_cf_options->target_file_size_base) {
-      status = FinishCompactionOutputBlob(status, sub_compact, {});
+        blob_builder->FileSize() > target_blob_file_size) {
+      s = FinishCompactionOutputBlob(s, sub_compact, {});
       blob_builder = nullptr;
     }
-    if (status.ok() && blob_builder == nullptr) {
-      status = OpenCompactionOutputBlob(sub_compact);
+    if (s.ok() && blob_builder == nullptr) {
+      s = OpenCompactionOutputBlob(sub_compact);
       blob_builder = sub_compact->blob_builder.get();
       blob_meta = &sub_compact->current_blob_output()->meta;
     }
-    if (status.ok()) {
-      status = blob_builder->Add(key, value);
+    if (s.ok()) {
+      s = blob_builder->Add(key, value);
     }
-    if (status.ok()) {
+    if (s.ok()) {
       blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
-      status = SeparateHelper::TransToSeparate(
+      s = SeparateHelper::TransToSeparate(
           key, value, blob_meta->fd.GetNumber(), Slice(),
           GetInternalKeyType(key) == kTypeMerge, false,
           separate_helper.value_meta_extractor.get());
     }
-    return status;
+    return s;
   };
 
   separate_helper.separate_helper = sub_compact->compaction->input_version();
@@ -1360,14 +1664,28 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     input->SeekToFirst();
   }
 
-  Status status;
+  SubcompactionState::RebuildBlobsInfo rebuild_blobs_info;
+  Status status = sub_compact->GetRebuildNeededBlobs(this, &rebuild_blobs_info);
+  if (!status.ok()) {
+    ROCKS_LOG_ERROR(
+        db_options_.info_log,
+        "[%s] [JOB %d] GetRebuildNeededBlobs Fail, status = %s",
+        compact_->compaction->column_family_data()->GetName().c_str(), job_id_,
+        status.ToString().c_str());
+    // GetRebuildNeededBlobs fail, we can continue compaction
+    rebuild_blobs_info.blobs.clear();
+    rebuild_blobs_info.pop_count = 0;
+    status = Status::OK();
+  }
+
   sub_compact->c_iter.reset(new CompactionIterator(
       input.get(), &separate_helper, end, cfd->user_comparator(), &merge,
       versions_->LastSequence(), &existing_snapshots_,
       earliest_write_conflict_snapshot_, snapshot_checker_, env_,
       ShouldReportDetailedTime(env_, stats_), false, &range_del_agg,
       sub_compact->compaction, mutable_cf_options->get_blob_config(),
-      compaction_filter, shutting_down_, preserve_deletes_seqnum_));
+      compaction_filter, shutting_down_, preserve_deletes_seqnum_,
+      &rebuild_blobs_info.blobs));
   auto c_iter = sub_compact->c_iter.get();
   c_iter->SeekToFirst();
 
@@ -1421,7 +1739,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
         snapshot_checker_, env_, false, false, range_del_agg_ptr,
         sub_compact->compaction, mutable_cf_options->get_blob_config(),
         second_pass_iter_storage.compaction_filter, shutting_down_,
-        preserve_deletes_seqnum_);
+        preserve_deletes_seqnum_, &rebuild_blobs_info.blobs);
   };
   std::unique_ptr<InternalIterator> second_pass_iter(
       NewCompactionIterator(c_style_callback(make_compaction_iterator),
@@ -1608,6 +1926,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
         }
         break;
       }
+      sub_compact->overlapped_bytes = 0;
       if (sub_compact->outputs.size() == 1) {
         // Use samples from first output file to create dictionary for
         // compression of subsequent files.
@@ -1677,6 +1996,16 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     if (status.ok()) {
       status = s;
     }
+  }
+
+  if (!rebuild_blobs_info.blobs.empty()) {
+    ROCKS_LOG_INFO(
+        db_options_.info_log,
+        "[%s] [JOB %d] Compaction auto rebuild %d(%d) blobs into %d new blobs",
+        compact_->compaction->column_family_data()->GetName().c_str(), job_id_,
+        rebuild_blobs_info.blobs.size(),
+        rebuild_blobs_info.blobs.size() + rebuild_blobs_info.pop_count,
+        sub_compact->blob_outputs.size());
   }
 
   if (measure_io_stats_) {
@@ -1772,13 +2101,37 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     uint64_t get_not_found = 0;
     uint64_t file_number_mismatch = 0;
   } counter;
+  std::vector<std::pair<uint64_t, FileMetaData*>> blob_meta_cache;
+  assert(!sub_compact->compaction->inputs()->empty());
+  blob_meta_cache.reserve(sub_compact->compaction->inputs()->front().size());
   while (status.ok() && !cfd->IsDropped() && input->Valid()) {
     ++counter.input;
     Slice curr_key = input->key();
     uint64_t curr_file_number = uint64_t(-1);
     if (!ParseInternalKey(curr_key, &ikey)) {
-      status = Status::Corruption("Invalid InternalKey");
+      status =
+          Status::Corruption("ProcessGarbageCollection invalid InternalKey");
       break;
+    }
+    uint64_t blob_file_number = input->value().file_number();
+    FileMetaData* blob_meta;
+    auto find_cache = std::find_if(
+        blob_meta_cache.begin(), blob_meta_cache.end(),
+        [blob_file_number](const std::pair<uint64_t, FileMetaData*>& pair) {
+          return pair.first == blob_file_number;
+        });
+    if (find_cache != blob_meta_cache.end()) {
+      blob_meta = find_cache->second;
+    } else {
+      auto find_dependence_map = dependence_map.find(blob_file_number);
+      if (find_dependence_map == dependence_map.end()) {
+        status =
+            Status::Corruption("ProcessGarbageCollection internal error !");
+        break;
+      }
+      blob_meta = find_dependence_map->second;
+      blob_meta_cache.emplace_back(blob_file_number, blob_meta);
+      assert(blob_meta->fd.GetNumber() == blob_file_number);
     }
     do {
       if (ikey.type != kTypeValue && ikey.type != kTypeMerge) {
@@ -1791,7 +2144,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       SequenceNumber seq = kMaxSequenceNumber;
       LazyBuffer value;
       input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s, &type,
-                            &seq, &value);
+                            &seq, &value, *blob_meta);
       if (s.IsNotFound()) {
         ++counter.get_not_found;
         break;
@@ -1854,26 +2207,14 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   if (status.ok()) {
     status = input->status();
   }
-  std::vector<uint64_t> inheritance_chain;
-  size_t raw_chain_length = 0;
-  for (auto& level : *sub_compact->compaction->inputs()) {
-    for (auto f : level.files) {
-      raw_chain_length += f->prop.inheritance_chain.size() + 1;
-      inheritance_chain.push_back(f->fd.GetNumber());
-      for (size_t i = 0; i < f->prop.inheritance_chain.size(); ++i) {
-        if (dependence_map.count(f->prop.inheritance_chain[i]) > 0) {
-          inheritance_chain.insert(inheritance_chain.end(),
-                                   f->prop.inheritance_chain.begin() + i,
-                                   f->prop.inheritance_chain.end());
-          break;
-        }
-      }
-    }
+  std::vector<uint64_t> inheritance_tree;
+  size_t inheritance_tree_pruge_count = 0;
+  if (status.ok()) {
+    status = BuildInheritanceTree(
+        *sub_compact->compaction->inputs(), dependence_map, input_version,
+        &inheritance_tree, &inheritance_tree_pruge_count);
   }
-  std::sort(inheritance_chain.begin(), inheritance_chain.end());
-  assert(std::unique(inheritance_chain.begin(), inheritance_chain.end()) ==
-         inheritance_chain.end());
-  Status s = FinishCompactionOutputBlob(status, sub_compact, inheritance_chain);
+  Status s = FinishCompactionOutputBlob(status, sub_compact, inheritance_tree);
   if (status.ok()) {
     status = s;
   }
@@ -1881,20 +2222,27 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     auto& meta = sub_compact->blob_outputs.front().meta;
     auto& inputs = *sub_compact->compaction->inputs();
     assert(inputs.size() == 1 && inputs.front().level == -1);
+    auto& files = inputs.front().files;
     ROCKS_LOG_INFO(
         db_options_.info_log,
         "[%s] [JOB %d] Table #%" PRIu64 " GC: %" PRIu64
         " inputs from %zd files. %" PRIu64
         " clear, %.2f%% estimation: [ %" PRIu64 " garbage type, %" PRIu64
         " get not found, %" PRIu64
-        " file number mismatch ], inheritance chain: %" PRIu64 " -> %" PRIu64,
+        " file number mismatch ], inheritance tree: %" PRIu64 " -> %" PRIu64,
         cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(), counter.input,
-        inputs.front().size(), counter.input - meta.prop.num_entries,
+        files.size(), counter.input - meta.prop.num_entries,
         sub_compact->compaction->num_antiquation() * 100. / counter.input,
         counter.garbage_type, counter.get_not_found,
-        counter.file_number_mismatch, raw_chain_length,
-        inheritance_chain.size());
-    if (counter.input == meta.prop.num_entries || meta.prop.num_entries == 0) {
+        counter.file_number_mismatch,
+        meta.prop.inheritance.size() + inheritance_tree_pruge_count,
+        meta.prop.inheritance.size());
+    if ((std::find_if(files.begin(), files.end(),
+                      [](FileMetaData* f) {
+                        return f->marked_for_compaction;
+                      }) == files.end() &&
+         files.size() == 1 && counter.input == meta.prop.num_entries) ||
+        meta.prop.num_entries == 0) {
       ROCKS_LOG_INFO(db_options_.info_log,
                      "[%s] [JOB %d] Table #%" PRIu64
                      " GC purge %s records, dropped",
@@ -2204,13 +2552,15 @@ Status CompactionJob::FinishCompactionOutputFile(
 
 Status CompactionJob::FinishCompactionOutputBlob(
     const Status& input_status, SubcompactionState* sub_compact,
-    const std::vector<uint64_t>& inheritance_chain) {
+    const std::vector<uint64_t>& inheritance_tree) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_SYNC_FILE);
   assert(sub_compact != nullptr);
   assert(sub_compact->blob_outfile);
   assert(sub_compact->blob_builder != nullptr);
   assert(sub_compact->current_blob_output() != nullptr);
+  TEST_SYNC_POINT_CALLBACK("CompactionJob::FinishCompactionOutputBlob::Start",
+                           &sub_compact->current_blob_output()->meta);
 
   uint64_t output_number =
       sub_compact->current_blob_output()->meta.fd.GetNumber();
@@ -2225,9 +2575,11 @@ Status CompactionJob::FinishCompactionOutputBlob(
   if (s.ok()) {
     meta->marked_for_compaction = sub_compact->blob_builder->NeedCompact();
     meta->prop.num_entries = sub_compact->blob_builder->NumEntries();
-    assert(std::is_sorted(inheritance_chain.begin(), inheritance_chain.end()));
-    meta->prop.inheritance_chain = inheritance_chain;
-    s = sub_compact->blob_builder->Finish(&meta->prop, nullptr);
+    meta->prop.inheritance = InheritanceTreeToSet(inheritance_tree);
+    assert(std::is_sorted(meta->prop.inheritance.begin(),
+                          meta->prop.inheritance.end()));
+    s = sub_compact->blob_builder->Finish(&meta->prop, nullptr,
+                                          &inheritance_tree);
   } else {
     sub_compact->blob_builder->Abandon();
   }
@@ -2432,11 +2784,13 @@ Status CompactionJob::InstallCompactionResults(
       }
     }
     db_mutex_->Unlock();
-    auto s = map_builder.Build(*compaction->inputs(), deleted_range,
-                               added_files, compaction->output_level(),
-                               compaction->output_path_id(), cfd,
-                               compaction->input_version(),
-                               compact_->compaction->edit(), &file_meta, &prop);
+    bool optimize_range_deletion = mutable_cf_options.optimize_range_deletion &&
+                                   !compaction->bottommost_level();
+    auto s = map_builder.Build(
+        *compaction->inputs(), deleted_range, added_files,
+        compaction->output_level(), compaction->output_path_id(), cfd,
+        optimize_range_deletion, compaction->input_version(),
+        compact_->compaction->edit(), &file_meta, &prop);
     if (s.ok() && file_meta.fd.file_size > 0) {
       // test map sst
       DependenceMap empty_dependence_map;
@@ -2598,8 +2952,9 @@ Status CompactionJob::OpenCompactionOutputFile(
   // If the Column family flag is to only optimize filters for hits,
   // we can skip creating filters if this is the bottommost_level where
   // data is going to be found
-  bool skip_filters =
-      cfd->ioptions()->optimize_filters_for_hits && bottommost_level_;
+  bool skip_filters = sub_compact->compaction->mutable_cf_options()
+                          ->optimize_filters_for_hits &&
+                      bottommost_level_;
 
   uint64_t output_file_creation_time =
       sub_compact->compaction->MaxInputFileCreationTime();

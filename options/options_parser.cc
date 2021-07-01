@@ -408,7 +408,7 @@ Status RocksDBOptionsParser::EndSection(
       return s;
     }
   } else if (section == kOptionSectionVersion) {
-    for (const auto pair : opt_map) {
+    for (const auto& pair : opt_map) {
       if (pair.first == "rocksdb_version") {
         s = ParseVersionNumber(pair.first, pair.second, 3, db_version);
         if (!s.ok()) {
@@ -565,17 +565,6 @@ bool AreEqualOptions(
     case OptionType::kInfoLogLevel:
       return (*reinterpret_cast<const InfoLogLevel*>(offset1) ==
               *reinterpret_cast<const InfoLogLevel*>(offset2));
-    case OptionType::kCompactionOptionsFIFO: {
-      CompactionOptionsFIFO lhs =
-          *reinterpret_cast<const CompactionOptionsFIFO*>(offset1);
-      CompactionOptionsFIFO rhs =
-          *reinterpret_cast<const CompactionOptionsFIFO*>(offset2);
-      if (lhs.max_table_files_size == rhs.max_table_files_size &&
-          lhs.ttl == rhs.ttl && lhs.allow_compaction == rhs.allow_compaction) {
-        return true;
-      }
-      return false;
-    }
     case OptionType::kCompactionOptionsUniversal: {
       CompactionOptionsUniversal lhs =
           *reinterpret_cast<const CompactionOptionsUniversal*>(offset1);
