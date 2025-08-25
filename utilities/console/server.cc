@@ -19,7 +19,7 @@
 namespace cheapis {
 using namespace TERARKDB_NAMESPACE;
 
-constexpr char kBindAddr[] = "0.0.0.0";
+constexpr char kBindAddr[] = "localhost";
 constexpr unsigned int kPort = 6379;
 constexpr unsigned int kBacklog = 511;
 constexpr unsigned int kCronInterval = 1;
